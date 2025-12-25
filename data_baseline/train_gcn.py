@@ -12,18 +12,24 @@ from data_utils import (
     load_id2emb,
     PreprocessedGraphDataset, collate_fn
 )
+from pathlib import Path
 
 
 # =========================================================
 # CONFIG
 # =========================================================
-# Data paths
-TRAIN_GRAPHS = "data/train_graphs.pkl"
-VAL_GRAPHS   = "data/validation_graphs.pkl"
-TEST_GRAPHS  = "data/test_graphs.pkl"
+file_path = Path(os.path.abspath(__file__))
+parent_folder = file_path.parent
 
-TRAIN_EMB_CSV = "data/train_embeddings.csv"
-VAL_EMB_CSV   = "data/validation_embeddings.csv"
+base_path = parent_folder / "data"
+
+# Data paths
+TRAIN_GRAPHS = str(base_path / "train_graphs.pkl")
+VAL_GRAPHS   = str(base_path / "validation_graphs.pkl")
+TEST_GRAPHS  = str(base_path / "test_graphs.pkl")
+
+TRAIN_EMB_CSV = str(base_path / "train_embeddings.csv")
+VAL_EMB_CSV   = str(base_path / "validation_embeddings.csv")
 
 # Training parameters
 BATCH_SIZE = 32
@@ -156,7 +162,7 @@ def main():
             val_scores = {}
         print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
     
-    model_path = "model_checkpoint.pt"
+    model_path = str(base_path / "model_checkpoint.pt")
     torch.save(mol_enc.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 

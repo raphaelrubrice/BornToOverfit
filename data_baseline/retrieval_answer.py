@@ -12,7 +12,7 @@ from data_utils import (
 from train_gcn import (
     MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
 )
-
+from pathlib import Path
 
 @torch.no_grad()
 def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, output_csv):
@@ -79,11 +79,16 @@ def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, 
 
 
 def main():
+    file_path = Path(os.path.abspath(__file__))
+    parent_folder = file_path.parent
+
+    base_path = parent_folder / "data"
+
     print(f"Device: {DEVICE}")
     
-    output_csv = "test_retrieved_descriptions.csv"
+    output_csv = str(base_path / "test_retrieved_descriptions.csv")
     
-    model_path = "model_checkpoint.pt"
+    model_path = str(base_path / "model_checkpoint.pt")
     if not os.path.exists(model_path):
         print(f"Error: Model checkpoint '{model_path}' not found.")
         print("Please train a model first using train_gcn.py")
