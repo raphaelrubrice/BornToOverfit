@@ -9,9 +9,12 @@ from data_utils import (
     load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
 )
 
-from train_gcn import (
-    MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
-)
+#from train_gcn import (
+#    MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
+#)
+
+from train_gcn_V1_edge_node import MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
+
 from pathlib import Path
 
 @torch.no_grad()
@@ -88,7 +91,7 @@ def main():
     
     output_csv = str(base_path / "test_retrieved_descriptions.csv")
     
-    model_path = str(base_path / "model_checkpoint.pt")
+    model_path = str(base_path / "model_checkpoint_v1.pt")
     if not os.path.exists(model_path):
         print(f"Error: Model checkpoint '{model_path}' not found.")
         print("Please train a model first using train_gcn.py")
