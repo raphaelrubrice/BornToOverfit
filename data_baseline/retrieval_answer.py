@@ -13,6 +13,7 @@ from train_gcn import (
     MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
 )
 from pathlib import Path
+from argparse import ArgumentParser
 
 @torch.no_grad()
 def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, output_csv):
@@ -78,11 +79,11 @@ def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, 
     return results_df
 
 
-def main():
+def main(folder):
     file_path = Path(os.path.abspath(__file__))
     parent_folder = file_path.parent
 
-    base_path = parent_folder / "data"
+    base_path = parent_folder.parent / folder
 
     print(f"Device: {DEVICE}")
     
@@ -119,5 +120,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    parser.add_argument("-f", default="data_baseline/data", type=str)
+
+    args = parser.parse_args()
+    folder = args.f
+    
+    main(folder)
 

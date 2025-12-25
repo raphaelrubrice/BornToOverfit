@@ -13,7 +13,7 @@ from data_utils import (
     PreprocessedGraphDataset, collate_fn
 )
 from pathlib import Path
-
+from argparse import ArgumentParser
 
 # =========================================================
 # CONFIG
@@ -134,7 +134,7 @@ def eval_retrieval(data_path, emb_dict, mol_enc, device):
 # =========================================================
 # Main Training Loop
 # =========================================================
-def main():
+def main(folder):
     print(f"Device: {DEVICE}")
 
     train_emb = load_id2emb(TRAIN_EMB_CSV)
@@ -162,10 +162,17 @@ def main():
             val_scores = {}
         print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
     
-    model_path = str(base_path / "model_checkpoint.pt")
+    save_path = parent_folder.parent / folder
+    model_path = str(save_path / "model_checkpoint.pt")
     torch.save(mol_enc.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = ArgumentParser()
+    parser.add_argument("-f", default="data_baseline/data", type=str)
+
+    args = parser.parse_args()
+    folder = args.f
+    
+    main(folder)
