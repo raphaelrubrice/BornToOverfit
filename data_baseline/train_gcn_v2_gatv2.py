@@ -36,7 +36,7 @@ TRAIN_EMB_CSV = str(base_path / "train_embeddings.csv")
 VAL_EMB_CSV   = str(base_path / "validation_embeddings.csv")
 
 BATCH_SIZE = 32
-EPOCHS = 10
+EPOCHS = 50
 LR = 5e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -209,17 +209,30 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     best_mrr = 0.0
+    patience = 5  # Nombre d'epochs sans amélioration avant d'arrêter
+    patience_counter = 0
+
     for ep in range(EPOCHS):
         loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
         val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE) if val_emb else {}
         print(f"Epoch {ep+1}/{EPOCHS} | loss={loss:.4f} | {val_scores}")
         scheduler.step()
-        if val_scores.get('MRR', 0) > best_mrr:
-            best_mrr = val_scores['MRR']
-            torch.save(mol_enc.state_dict(), str(base_path / "model_checkpoint_v2_gatv2.pt"))
-            print(f"  → New best MRR: {best_mrr:.4f}")
 
-    print(f"\nDone. Best MRR: {best_mrr:.4f}")
+        current_mrr = val_scores.get('MRR', 0)
+        if current_mrr > best_mrr:
+            best_mrr = current_mrr
+            patience_counter = 0
+            torch.save(mol_enc.state_dict(), str(base_path / "model_checkpoint_v3_gps.pt"))
+            print(f"  → New best MRR: {best_mrr:.4f}")
+        else:
+            patience_counter += 1
+            print(f"  → No improvement ({patience_counter}/{patience})")
+
+        if patience_counter >= patience:
+            print(f"\nEarly stopping at epoch {ep+1}")
+            break
+
+        print(f"\nDone. Best MRR: {best_mrr:.4f}")
 
 
 if __name__ == "__main__":
