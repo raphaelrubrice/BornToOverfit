@@ -1,118 +1,90 @@
 import os
-
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from data_utils import (
-    load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
-)
+from transformers import AutoTokenizer
 
-from train_gcn import (
-    MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
-)
+from data_utils import MoleculeTestDataset, test_collate_fn, x_map, e_map
+from model_captioning import Graph2TextModel
 
 
-@torch.no_grad()
-def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, output_csv):
-    """
-    Args:
-        model: Trained GNN model
-        train_data: Path to train preprocessed graphs
-        test_data: Path to test preprocessed graphs
-        train_emb_dict: Dictionary mapping train IDs to text embeddings
-        device: Device to run on
-        output_csv: Path to save retrieved descriptions
-    """
-    train_id2desc = load_descriptions_from_graphs(train_data)
-    
-    train_ids = list(train_emb_dict.keys())
-    train_embs = torch.stack([train_emb_dict[id_] for id_ in train_ids]).to(device)
-    train_embs = F.normalize(train_embs, dim=-1)
-    
-    print(f"Train set size: {len(train_ids)}")
-    
-    test_ds = PreprocessedGraphDataset(test_data)
-    test_dl = DataLoader(test_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
-    
-    print(f"Test set size: {len(test_ds)}")
-    
-    test_mol_embs = []
-    test_ids_ordered = []
-    for graphs in test_dl:
-        graphs = graphs.to(device)
-        mol_emb = model(graphs)
-        test_mol_embs.append(mol_emb)
-        batch_size = graphs.num_graphs
-        start_idx = len(test_ids_ordered)
-        test_ids_ordered.extend(test_ds.ids[start_idx:start_idx + batch_size])
-    
-    test_mol_embs = torch.cat(test_mol_embs, dim=0)
-    print(f"Encoded {test_mol_embs.size(0)} test molecules")
-    
-    similarities = test_mol_embs @ train_embs.t()
-    
-    most_similar_indices = similarities.argmax(dim=-1).cpu()
-    
-    results = []
-    for i, test_id in enumerate(test_ids_ordered):
-        train_idx = most_similar_indices[i].item()
-        retrieved_train_id = train_ids[train_idx]
-        retrieved_desc = train_id2desc[retrieved_train_id]
-        
-        results.append({
-            'ID': test_id,
-            'description': retrieved_desc
-        })
-        
-        if i < 5:
-            print(f"\nTest ID {test_id}: Retrieved from train ID {retrieved_train_id}")
-            print(f"Description: {retrieved_desc[:150]}...")
-    
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(output_csv, index=False)
-    print(f"\n{'='*80}")
-    print(f"Saved {len(results)} retrieved descriptions to: {output_csv}")
-    
-    return results_df
+# =========================================================
+# PATHS
+# =========================================================
+TEST_GRAPHS = "data/test_graphs.pkl"
+CKPT_PATH = "checkpoints/graph2text_gpt2.pt"
+OUTPUT_CSV = "test_generated_descriptions.csv"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def main():
-    print(f"Device: {DEVICE}")
-    
-    output_csv = "test_retrieved_descriptions.csv"
-    
-    model_path = "model_checkpoint.pt"
-    if not os.path.exists(model_path):
-        print(f"Error: Model checkpoint '{model_path}' not found.")
-        print("Please train a model first using train_gcn.py")
-        return
-    
+    if not os.path.exists(CKPT_PATH):
+        raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}. Train first: python train_gcn.py")
+
     if not os.path.exists(TEST_GRAPHS):
-        print(f"Error: Preprocessed graphs not found at {TEST_GRAPHS}")
-        return
-    
-    train_emb = load_id2emb(TRAIN_EMB_CSV)
-    
-    emb_dim = len(next(iter(train_emb.values())))
-    
-    model = MolGNN(out_dim=emb_dim).to(DEVICE)
-    print(f"Loading model from {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        raise FileNotFoundError(f"Test graphs not found: {TEST_GRAPHS}")
+
+    ckpt = torch.load(CKPT_PATH, map_location="cpu")
+    tokenizer = AutoTokenizer.from_pretrained(ckpt["tokenizer_name"])
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    atom_vocab_sizes = [
+        len(x_map["atomic_num"]),
+        len(x_map["chirality"]),
+        len(x_map["degree"]),
+        len(x_map["formal_charge"]),
+        len(x_map["num_hs"]),
+        len(x_map["num_radical_electrons"]),
+        len(x_map["hybridization"]),
+        len(x_map["is_aromatic"]),
+        len(x_map["is_in_ring"]),
+    ]
+    bond_vocab_sizes = [
+        len(e_map["bond_type"]),
+        len(e_map["stereo"]),
+        len(e_map["is_conjugated"]),
+    ]
+
+    model = Graph2TextModel(
+        atom_vocab_sizes=atom_vocab_sizes,
+        bond_vocab_sizes=bond_vocab_sizes,
+        d_model=768,
+        gnn_layers=4,
+        gpt2_name=ckpt["tokenizer_name"],
+        dropout=0.1,
+    ).to(DEVICE)
+
+    model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
-    
-    retrieve_descriptions(
-        model=model,
-        train_data=TRAIN_GRAPHS,
-        test_data=TEST_GRAPHS,
-        train_emb_dict=train_emb,
-        device=DEVICE,
-        output_csv=output_csv
-    )
-    
+
+    test_ds = MoleculeTestDataset(TEST_GRAPHS)
+    test_dl = DataLoader(test_ds, batch_size=32, shuffle=False, collate_fn=test_collate_fn)
+
+    results = []
+    for batch_graph, ids in tqdm(test_dl, desc="Generating"):
+        batch_graph = batch_graph.to(DEVICE)
+        gen_ids = model.generate(
+            batch_graph,
+            tokenizer,
+            max_new_tokens=128,
+            num_beams=5,
+            length_penalty=1.0,
+        )
+        texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        texts = [t.strip() for t in texts]
+
+        for _id, txt in zip(ids, texts):
+            results.append({"ID": _id, "description": txt})
+
+    df = pd.DataFrame(results)
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅ Saved submission-like file to {OUTPUT_CSV} ({len(df)} rows)")
+    print(df.head())
 
 
 if __name__ == "__main__":
     main()
-
