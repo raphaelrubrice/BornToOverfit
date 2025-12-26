@@ -1,164 +1,220 @@
 import os
+import random
+from dataclasses import dataclass
+from typing import Dict
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from torch_geometric.data import Batch
-from torch_geometric.nn import GCNConv, global_add_pool
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from data_utils import (
-    load_id2emb,
-    PreprocessedGraphDataset, collate_fn
+    MoleculeCaptionDataset,
+    make_caption_collate_fn,
+    x_map,
+    e_map,
 )
+
+from model_captioning import Graph2TextModel
 
 
 # =========================================================
 # CONFIG
 # =========================================================
-# Data paths
 TRAIN_GRAPHS = "data/train_graphs.pkl"
 VAL_GRAPHS   = "data/validation_graphs.pkl"
 TEST_GRAPHS  = "data/test_graphs.pkl"
 
-TRAIN_EMB_CSV = "data/train_embeddings.csv"
-VAL_EMB_CSV   = "data/validation_embeddings.csv"
+MODEL_DIR = "checkpoints"
+CKPT_PATH = os.path.join(MODEL_DIR, "graph2text_gpt2.pt")
 
-# Training parameters
-BATCH_SIZE = 32
-EPOCHS = 5
-LR = 1e-3
+GPT2_NAME = "gpt2"          # keep for tokenizer & decoder
+MAX_LEN = 128
+
+BATCH_SIZE = 16
+EPOCHS = 3
+LR = 5e-5
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.06
+GRAD_CLIP = 1.0
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SEED = 42
 
 
-# =========================================================
-# MODEL: GNN to encode graphs (simple GCN, no edge features)
-# =========================================================
-class MolGNN(nn.Module):
-    def __init__(self, hidden=128, out_dim=256, layers=3):
-        super().__init__()
-
-        # Use a single learnable embedding for all nodes (no node features)
-        self.node_init = nn.Parameter(torch.randn(hidden))
-
-        self.convs = nn.ModuleList()
-        for _ in range(layers):
-            self.convs.append(GCNConv(hidden, hidden))
-
-        self.proj = nn.Linear(hidden, out_dim)
-
-    def forward(self, batch: Batch):
-        # Initialize all nodes with the same learnable embedding
-        num_nodes = batch.x.size(0)
-        h = self.node_init.unsqueeze(0).expand(num_nodes, -1)
-        
-        for conv in self.convs:
-            h = conv(h, batch.edge_index)
-            h = F.relu(h)
-        g = global_add_pool(h, batch.batch)
-        g = self.proj(g)
-        g = F.normalize(g, dim=-1)
-        return g
-
-
-# =========================================================
-# Training and Evaluation
-# =========================================================
-def train_epoch(mol_enc, loader, optimizer, device):
-    mol_enc.train()
-
-    total_loss, total = 0.0, 0
-    for graphs, text_emb in loader:
-        graphs = graphs.to(device)
-        text_emb = text_emb.to(device)
-
-        mol_vec = mol_enc(graphs)
-        txt_vec = F.normalize(text_emb, dim=-1)
-
-        loss = F.mse_loss(mol_vec, txt_vec)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        bs = graphs.num_graphs
-        total_loss += loss.item() * bs
-        total += bs
-
-    return total_loss / total
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 @torch.no_grad()
-def eval_retrieval(data_path, emb_dict, mol_enc, device):
-    ds = PreprocessedGraphDataset(data_path, emb_dict)
-    dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
-
-    all_mol, all_txt = [], []
-    for graphs, text_emb in dl:
-        graphs = graphs.to(device)
-        text_emb = text_emb.to(device)
-        all_mol.append(mol_enc(graphs))
-        all_txt.append(F.normalize(text_emb, dim=-1))
-    all_mol = torch.cat(all_mol, dim=0)
-    all_txt = torch.cat(all_txt, dim=0)
-
-    sims = all_txt @ all_mol.t()
-    ranks = sims.argsort(dim=-1, descending=True)
-
-    N = all_txt.size(0)
-    device = sims.device
-    correct = torch.arange(N, device=device)
-
-    pos = (ranks == correct.unsqueeze(1)).nonzero()[:, 1] + 1
-
-    mrr = (1.0 / pos.float()).mean().item()
-
-    results = {"MRR": mrr}
-
-    for k in (1, 5, 10):
-        hitk = (pos <= k).float().mean().item()
-        results[f"R@{k}"] = hitk
-        results[f"Hit@{k}"] = hitk
-
-    return results
+def greedy_validate(model, tokenizer, val_loader, device, max_batches: int = 30):
+    """
+    Quick qualitative validation: generate a few samples each epoch.
+    Not a full BLEU/BERTScore eval (kept simple).
+    """
+    model.eval()
+    samples = []
+    for i, (g, input_ids, attn_mask, labels, ids) in enumerate(val_loader):
+        if i >= max_batches:
+            break
+        g = g.to(device)
+        gen_ids = model.generate(g, tokenizer, max_new_tokens=96, num_beams=3)
+        texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        # Store first 2
+        for t in texts[:2]:
+            samples.append(t.strip())
+        if len(samples) >= 6:
+            break
+    return samples
 
 
-
-# =========================================================
-# Main Training Loop
-# =========================================================
 def main():
+    seed_everything(SEED)
+    os.makedirs(MODEL_DIR, exist_ok=True)
     print(f"Device: {DEVICE}")
 
-    train_emb = load_id2emb(TRAIN_EMB_CSV)
-    val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(GPT2_NAME)
+    # GPT2 has no pad token by default => set pad = eos
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    emb_dim = len(next(iter(train_emb.values())))
+    # Datasets
+    train_ds = MoleculeCaptionDataset(TRAIN_GRAPHS)
+    val_ds = MoleculeCaptionDataset(VAL_GRAPHS) if os.path.exists(VAL_GRAPHS) else None
 
-    if not os.path.exists(TRAIN_GRAPHS):
-        print(f"Error: Preprocessed graphs not found at {TRAIN_GRAPHS}")
-        print("Please run: python prepare_graph_data.py")
-        return
-    
-    train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
-    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    train_collate = make_caption_collate_fn(tokenizer, max_length=MAX_LEN)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=train_collate, num_workers=0)
 
-    mol_enc = MolGNN(out_dim=emb_dim).to(DEVICE)
+    val_dl = None
+    if val_ds is not None:
+        val_collate = make_caption_collate_fn(tokenizer, max_length=MAX_LEN)
+        val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=val_collate, num_workers=0)
 
-    optimizer = torch.optim.Adam(mol_enc.parameters(), lr=LR)
+    # Vocab sizes for embeddings
+    atom_vocab_sizes = [
+        len(x_map["atomic_num"]),
+        len(x_map["chirality"]),
+        len(x_map["degree"]),
+        len(x_map["formal_charge"]),
+        len(x_map["num_hs"]),
+        len(x_map["num_radical_electrons"]),
+        len(x_map["hybridization"]),
+        len(x_map["is_aromatic"]),
+        len(x_map["is_in_ring"]),
+    ]
+    bond_vocab_sizes = [
+        len(e_map["bond_type"]),
+        len(e_map["stereo"]),
+        len(e_map["is_conjugated"]),
+    ]
 
-    for ep in range(EPOCHS):
-        train_loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
-        if val_emb is not None and os.path.exists(VAL_GRAPHS):
-            val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE)
-        else:
-            val_scores = {}
-        print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
-    
-    model_path = "model_checkpoint.pt"
-    torch.save(mol_enc.state_dict(), model_path)
-    print(f"\nModel saved to {model_path}")
+    # Model
+    model = Graph2TextModel(
+        atom_vocab_sizes=atom_vocab_sizes,
+        bond_vocab_sizes=bond_vocab_sizes,
+        d_model=768,
+        gnn_layers=4,
+        gpt2_name=GPT2_NAME,
+        dropout=0.1,
+    ).to(DEVICE)
+
+    # Optim & sched
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    total_steps = EPOCHS * len(train_dl)
+    warmup_steps = int(WARMUP_RATIO * total_steps)
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
+
+    best_val_loss = float("inf")
+
+    for ep in range(1, EPOCHS + 1):
+        model.train()
+        pbar = tqdm(train_dl, desc=f"Epoch {ep}/{EPOCHS}")
+        total_loss = 0.0
+        total_items = 0
+
+        for batch_graph, input_ids, attn_mask, labels, ids in pbar:
+            batch_graph = batch_graph.to(DEVICE)
+            input_ids = input_ids.to(DEVICE)
+            attn_mask = attn_mask.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            out = model(
+                batch_graph=batch_graph,
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                labels=labels,
+            )
+            loss = out.loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            scheduler.step()
+
+            bs = batch_graph.num_graphs
+            total_loss += loss.item() * bs
+            total_items += bs
+            pbar.set_postfix(loss=loss.item())
+
+        train_loss = total_loss / max(1, total_items)
+        print(f"\nEpoch {ep}: train_loss={train_loss:.4f}")
+
+        # Validation loss (teacher forcing)
+        val_loss = None
+        if val_dl is not None:
+            model.eval()
+            vloss_sum, vcount = 0.0, 0
+            for batch_graph, input_ids, attn_mask, labels, ids in tqdm(val_dl, desc="Valid", leave=False):
+                batch_graph = batch_graph.to(DEVICE)
+                input_ids = input_ids.to(DEVICE)
+                attn_mask = attn_mask.to(DEVICE)
+                labels = labels.to(DEVICE)
+
+                out = model(
+                    batch_graph=batch_graph,
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
+                    labels=labels,
+                )
+                bs = batch_graph.num_graphs
+                vloss_sum += out.loss.item() * bs
+                vcount += bs
+
+            val_loss = vloss_sum / max(1, vcount)
+            print(f"Epoch {ep}: val_loss={val_loss:.4f}")
+
+            # quick qualitative generation
+            samples = greedy_validate(model, tokenizer, val_dl, DEVICE, max_batches=10)
+            print("\n[Sample generations]")
+            for s in samples[:5]:
+                print("-", s[:200])
+
+        # Save best
+        metric = val_loss if val_loss is not None else train_loss
+        if metric < best_val_loss:
+            best_val_loss = metric
+            ckpt = {
+                "model_state": model.state_dict(),
+                "tokenizer_name": GPT2_NAME,
+                "max_len": MAX_LEN,
+            }
+            torch.save(ckpt, CKPT_PATH)
+            print(f"\n✅ Saved best checkpoint to {CKPT_PATH}")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
