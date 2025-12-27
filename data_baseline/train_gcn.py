@@ -15,28 +15,6 @@ from data_utils import (
 from pathlib import Path
 from argparse import ArgumentParser
 
-# =========================================================
-# CONFIG
-# =========================================================
-file_path = Path(os.path.abspath(__file__))
-parent_folder = file_path.parent
-
-base_path = parent_folder / "data"
-
-# Data paths
-TRAIN_GRAPHS = str(base_path / "train_graphs.pkl")
-VAL_GRAPHS   = str(base_path / "validation_graphs.pkl")
-TEST_GRAPHS  = str(base_path / "test_graphs.pkl")
-
-TRAIN_EMB_CSV = str(base_path / "train_embeddings.csv")
-VAL_EMB_CSV   = str(base_path / "validation_embeddings.csv")
-
-# Training parameters
-BATCH_SIZE = 32
-EPOCHS = 5
-LR = 1e-3
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 # =========================================================
 # MODEL: GNN to encode graphs (simple GCN, no edge features)
@@ -163,6 +141,7 @@ def main(folder):
         print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={val_scores}")
     
     save_path = parent_folder.parent / folder
+    os.makedirs(str(save_path), exist_ok=True)
     model_path = str(save_path / "model_checkpoint.pt")
     torch.save(mol_enc.state_dict(), model_path)
     print(f"\nModel saved to {model_path}")
@@ -170,9 +149,34 @@ def main(folder):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
+    parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
 
     args = parser.parse_args()
+    data_folder = args.f_data
     folder = args.f
     
+    # =========================================================
+    # CONFIG
+    # =========================================================
+    file_path = Path(os.path.abspath(__file__))
+    parent_folder = file_path.parent
+
+    data_path = parent_folder.parent / data_folder
+    base_path = parent_folder.parent / folder
+
+    # Data paths
+    TRAIN_GRAPHS = str(data_path / "train_graphs.pkl")
+    VAL_GRAPHS   = str(data_path / "validation_graphs.pkl")
+    TEST_GRAPHS  = str(data_path / "test_graphs.pkl")
+
+    TRAIN_EMB_CSV = str(base_path / "train_embeddings.csv")
+    VAL_EMB_CSV   = str(base_path / "validation_embeddings.csv")
+
+    # Training parameters
+    BATCH_SIZE = 32
+    EPOCHS = 5
+    LR = 1e-3
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
     main(folder)
