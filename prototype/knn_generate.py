@@ -612,8 +612,8 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("-f_data", default="data_baseline/data", type=str, help="Folder containing *graphs.pkl files")
     parser.add_argument("-f", default="data_baseline/data", type=str, help="Folder containing embeddings/model checkpoint")
-    parser.add_argument("--k", default=5, type=int)
-    parser.add_argument("--encode_batch_size", default=64, type=int)
+    parser.add_argument("--k", default=3, type=int)
+    parser.add_argument("--encode_batch_size", default=128, type=int)
     parser.add_argument("--max_train_samples", default=None, type=int, help="Limit RL dataset size for quick prototyping")
 
     # LLM
@@ -637,7 +637,7 @@ def main():
     # GRPO params (prototype defaults)
     parser.add_argument("--steps", default=300, type=int)
     parser.add_argument("--lr", default=5e-6, type=float)
-    parser.add_argument("--per_device_bs", default=2, type=int)
+    parser.add_argument("--per_device_bs", default=16, type=int)
     parser.add_argument("--grad_accum", default=4, type=int)
     parser.add_argument("--num_generations", default=4, type=int)
     parser.add_argument("--use_lora", action="store_true", help="Use LoRA adapters (recommended)")
