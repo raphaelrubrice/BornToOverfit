@@ -39,7 +39,8 @@ if __name__ == "__main__":
 
     data_path = parent_folder.parent / data_folder
     base_path = parent_folder.parent / folder
-
+    os.makedirs(str(base_path), exist_ok=True)
+    
     # Configuration
     MAX_TOKEN_LENGTH = 128
 

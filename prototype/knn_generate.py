@@ -55,17 +55,23 @@ from trl import GRPOTrainer, GRPOConfig
 import sacrebleu
 from bert_score import score as bertscore
 
-from data_utils import (
+import sys, os
+# To ensure the custom package is found
+path_to_repo = "/".join(os.path.abspath(__file__).split("/")[:-2])
+if path_to_repo not in sys.path:
+    sys.path.append(path_to_repo)
+
+from data_baseline.data_utils import (
     load_id2emb,
     load_descriptions_from_graphs,
     PreprocessedGraphDataset,
     collate_fn,
 )
-from train_gcn import MolGNN
+from data_baseline.train_gcn import MolGNN
 
 _EVAL_AVAILABLE = True
 try:
-    from retrieval_answer import evaluate_retrieval_text_metrics  # :contentReference[oaicite:0]{index=0}
+    from data_baseline.retrieval_answer import evaluate_retrieval_text_metrics  # :contentReference[oaicite:0]{index=0}
 except Exception:
     _EVAL_AVAILABLE = False
 
@@ -189,6 +195,50 @@ def bertscore_f1_roberta_base(
     )
     return float(F1.mean().item())
 
+def bleu_f1_sentence(pred: str, ref: str, tokenize: str = "13a") -> float:
+    """
+    Per-sample BLEU-F1 in [0, 1].
+      precision proxy: sentence_bleu(pred, [ref])
+      recall proxy:    sentence_bleu(ref, [pred])
+    """
+    pred_l = (pred or "").lower()
+    ref_l = (ref or "").lower()
+
+    bleu_p = sacrebleu.sentence_bleu(pred_l, [ref_l], tokenize=tokenize).score
+    bleu_r = sacrebleu.sentence_bleu(ref_l, [pred_l], tokenize=tokenize).score
+
+    denom = bleu_p + bleu_r
+    bleu_f1 = (2.0 * bleu_p * bleu_r / denom) if denom > 0 else 0.0
+    return float(bleu_f1 / 100.0)
+
+class CachedBERTScorer:
+    """
+    Cache RoBERTa model/tokenizer to avoid re-loading BERTScore at every RL step.
+    Computes per-sample BERTScore F1.
+    """
+    def __init__(self, device: str, batch_size: int = 32):
+        from bert_score import BERTScorer
+
+        self.device = device
+        self.batch_size = batch_size
+
+        # BERTScorer internally caches the model/tokenizer after construction
+        self.scorer = BERTScorer(
+            model_type="roberta-base",
+            lang="en",
+            device=device,
+            batch_size=batch_size,
+            idf=False,
+            rescale_with_baseline=False,
+        )
+
+    @torch.no_grad()
+    def score_f1(self, preds: List[str], refs: List[str]) -> List[float]:
+        """
+        Returns per-sample BERTScore F1 in [0, 1].
+        """
+        P, R, F1 = self.scorer.score(preds, refs)
+        return F1.detach().cpu().tolist()
 
 def make_reward_fn(
     device: str,
@@ -199,45 +249,42 @@ def make_reward_fn(
     bert_batch_size: int = 32,
 ):
     """
-    TRL GRPO reward function.
+    GRPO reward with:
+      - per-sample BLEU-F1
+      - per-sample BERTScore F1
+      - cached RoBERTa model
+      - exact-match shaping
 
-    TRL passes:
-      completions: list[list[dict]] where completion[0]["content"] is the generated text
-      plus any dataset columns as kwargs, e.g. reference=[...]
+    This guarantees non-zero reward variance within GRPO groups.
     """
+    bert_scorer = CachedBERTScorer(device=device, batch_size=bert_batch_size)
 
     def reward_fn(completions, reference, **kwargs):
-        # completions length = batch_size * num_generations_per_prompt (GRPO uses groups)
-        pred_texts = [c[0]["content"] for c in completions]
+        preds = [c[0]["content"] for c in completions]
         refs = list(reference)
 
-        # Ensure alignment
-        if len(pred_texts) != len(refs):
-            # TRL should align these; if not, best-effort truncate
-            n = min(len(pred_texts), len(refs))
-            pred_texts = pred_texts[:n]
-            refs = refs[:n]
+        n = min(len(preds), len(refs))
+        preds = preds[:n]
+        refs = refs[:n]
 
-        # Exact-match shaping
-        exact = []
-        for p, r in zip(pred_texts, refs):
-            exact.append(1 if _normalize_text(p) == _normalize_text(r) and len(_normalize_text(r)) > 0 else 0)
+        # Exact match (per sample)
+        exact = [
+            1 if _normalize_text(p) == _normalize_text(r) and len(_normalize_text(r)) > 0 else 0
+            for p, r in zip(preds, refs)
+        ]
 
-        # Metric shaping
-        # BLEU-F1 computed at corpus-level across the batch; broadcast to each example
-        bleu = bleu_f1_corpus(pred_texts, refs)  # scalar
-        # BERTScore across the batch; scalar
-        bert = bertscore_f1_roberta_base(pred_texts, refs, device=device, batch_size=bert_batch_size)  # scalar
+        # Per-sample metrics
+        bleu_scores = [bleu_f1_sentence(p, r) for p, r in zip(preds, refs)]
+        bert_scores = bert_scorer.score_f1(preds, refs)
 
         rewards = []
-        for ex in exact:
-            em_term = (exact_bonus if ex == 1 else -exact_penalty)
-            shaped = (bleu_weight * bleu) + (bert_weight * bert)
+        for ex, b, bf in zip(exact, bleu_scores, bert_scores):
+            em_term = exact_bonus if ex == 1 else -exact_penalty
+            shaped = bleu_weight * b + bert_weight * bf
             rewards.append(float(em_term + shaped))
 
-        # Optional: clip reward to stabilize
-        rewards = [max(-2.0, min(2.0, r)) for r in rewards]
-        return rewards
+        # Stabilization
+        return [max(-2.0, min(2.0, r)) for r in rewards]
 
     return reward_fn
 
@@ -361,7 +408,7 @@ def finetune_base_model(
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model_name_or_path,
-        torch_dtype=torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32),
+        dtype=torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32),
         device_map="auto" if torch.cuda.is_available() else None,
     )
 
@@ -398,7 +445,6 @@ def finetune_base_model(
 
     trainer = GRPOTrainer(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
         reward_funcs=reward_fn,
@@ -472,7 +518,7 @@ def generate_desc(
 
     llm = AutoModelForCausalLM.from_pretrained(
         llm_dir_or_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
     )
     llm.eval()
@@ -700,7 +746,7 @@ def main():
             encode_batch_size=args.encode_batch_size,
             gen_batch_size=args.gen_batch_size,
             max_new_tokens=args.max_new_tokens,
-            evaluate=eval_flag,  # <-- ADD
+            evaluate=eval_flag,
         )
 
     if (not args.do_finetune) and (not args.do_generate):

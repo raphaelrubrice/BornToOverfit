@@ -8,10 +8,17 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 from torch_geometric.nn import GCNConv, global_add_pool
 
-from data_utils import (
-    load_id2emb,
-    PreprocessedGraphDataset, collate_fn
-)
+try:
+    from.data_utils import (
+        load_id2emb,
+        PreprocessedGraphDataset, collate_fn
+    )
+except:
+    from data_utils import (
+        load_id2emb,
+        PreprocessedGraphDataset, collate_fn
+    )
+    
 from pathlib import Path
 from argparse import ArgumentParser
 

@@ -4,17 +4,23 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-
-from data_utils import (
-    load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
-)
 import json
 from typing import List, Dict, Tuple
 
 import sacrebleu
 from bert_score import score as bertscore
 
-from train_gcn import MolGNN
+try:
+    from.data_utils import (
+    load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
+    )
+    from.train_gcn import MolGNN
+except:
+    from data_utils import (
+    load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
+    )
+    from train_gcn import MolGNN
+
 from pathlib import Path
 from argparse import ArgumentParser
 
@@ -215,7 +221,7 @@ def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, 
     
     if evaluate:
         test_id2desc = load_descriptions_from_graphs(test_data)
-        
+
         metrics_path = str(Path(output_csv).with_suffix(".metrics.json"))
         evaluate_retrieval_text_metrics(
             results_df=results_df,
