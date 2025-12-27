@@ -44,13 +44,24 @@ from datasets import Dataset
 
 from transformers import (
     AutoTokenizer,
+    AutoConfig,
     AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
     GenerationConfig,
+    Trainer,
+    TrainingArguments,
 )
 
 from peft import LoraConfig, get_peft_model
 
-from trl import GRPOTrainer, GRPOConfig
+from trl import (
+    GRPOTrainer,
+    GRPOConfig,
+    PPOTrainer,
+    PPOConfig,
+    AutoModelForCausalLMWithValueHead,
+    AutoModelForSeq2SeqLMWithValueHead,
+)
 
 import sacrebleu
 from bert_score import score as bertscore
@@ -66,6 +77,8 @@ from data_baseline.data_utils import (
     load_descriptions_from_graphs,
     PreprocessedGraphDataset,
     collate_fn,
+    make_mol_repr,
+    load_mol_cards_from_graphs
 )
 from data_baseline.train_gcn import MolGNN
 
@@ -78,7 +91,7 @@ except Exception:
 # --------------------------------------------------------------------------------------
 # Prompting utilities
 # --------------------------------------------------------------------------------------
-def build_prompt(neighbor_descs: List[str]) -> str:
+def build_prompt(query_card, neighbor_descs: List[str], neighbor_cards: List[str]) -> str:
     lines = []
     lines.append("Here are the descriptions of the K nearest molecules to the query molecule from nearest to furthest.")
     for d in neighbor_descs:
@@ -86,6 +99,42 @@ def build_prompt(neighbor_descs: List[str]) -> str:
     lines.append("Based on previous descriptions, generate the accurate description of the query molecule.")
     return "\n".join(lines)
 
+# Here are Molecule Card and Description pairs for the K nearest neighbors to the query molecule in training data ....
+# Molecule Card Neighbor 1
+# Description Neighbor 1
+# ...
+# Now, here is the Molecule Card of the query molecule. Generate the accurate description of this molecule.
+# Molecule Card Query
+def build_prompt(query_card: str, neighbor_descs: List[str], neighbor_cards: List[str]) -> str:
+    """
+    New prompting approach:
+      - Provide (card, description) pairs for each neighbor
+      - Provide the query molecule card
+      - Explicit instruction to treat MOL_FEATURES as constraints and neighbors as examples
+    """
+    lines: List[str] = []
+    lines.append(
+        "You are given molecule 'info cards' and descriptions for K nearest neighbor molecules from training data."
+    )
+    lines.append("Use them as examples and evidence, but follow the query molecule card as the factual constraint.")
+    lines.append("Do not assert elements, charge sign, aromaticity, or ring presence that contradict the query card.")
+    lines.append("")
+
+    lines.append("[NEIGHBORS]")
+    for i, (c, d) in enumerate(zip(neighbor_cards, neighbor_descs), start=1):
+        lines.append(f"Neighbor {i} - Molecule Card:")
+        lines.append(c.strip() if c else "[MOL_FEATURES]\nunknown\n[/MOL_FEATURES]")
+        lines.append(f"Neighbor {i} - Description:")
+        lines.append((d or "").strip())
+        lines.append("")
+    lines.append("[/NEIGHBORS]")
+    lines.append("")
+
+    lines.append("Query Molecule Card:")
+    lines.append(query_card.strip() if query_card else "[MOL_FEATURES]\nunknown\n[/MOL_FEATURES]")
+    lines.append("")
+    lines.append("Task: Give an accurate, factual and concise description of the query molecule in the same style as the training descriptions.")
+    return "\n".join(lines)
 
 def prompt_as_chat(prompt_text: str) -> List[Dict[str, str]]:
     """
@@ -304,12 +353,12 @@ def build_knn_prompt_dataset(
     leave_one_out: bool = True,
 ) -> Dataset:
     """
-    Create a Dataset with columns:
+    Dataset columns:
       - prompt:    chat-style messages (list[{"role","content"}])
       - reference: ground-truth description (string)
 
-    We use TRAIN split for RL prompts. For each train molecule, we retrieve K neighbors from the
-    same train set. If leave_one_out=True, we disallow selecting itself.
+    Uses TRAIN split for RL prompts with leave-one-out KNN retrieval.
+    Incorporates mol_card (query + neighbors) in prompts.
     """
     # Load train text embeddings (targets of GNN)
     train_id2emb = load_id2emb(train_emb_csv)
@@ -317,23 +366,20 @@ def build_knn_prompt_dataset(
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
 
-    # Load descriptions
+    # Load descriptions + mol_cards
     train_id2desc = load_descriptions_from_graphs(train_graphs)
+    train_id2card = load_mol_cards_from_graphs(train_graphs)
 
     # Encode training graphs with GNN
-    train_gnn_embs, train_ids_ordered = encode_graphs(gnn_model, train_graphs, device=device, batch_size=encode_batch_size)
+    train_gnn_embs, train_ids_ordered = encode_graphs(
+        gnn_model, train_graphs, device=device, batch_size=encode_batch_size
+    )
 
-    # Align to embeddings CSV order:
-    # The embeddings CSV may have a different order from PreprocessedGraphDataset ids.
-    # We will build a mapping from train_ids->index in train_embs for retrieval
+    # Align indices for leave-one-out
     id_to_trainemb_index = {tid: idx for idx, tid in enumerate(train_ids)}
-    # We also need train_embs aligned to train_ids_ordered (query side retrieval uses train_embs pool)
-    # Retrieval pool stays as (train_ids, train_embs). Query embeddings correspond to train_ids_ordered.
 
-    # Leave-one-out mask
     mask_self = None
     if leave_one_out:
-        # Build [Nq, Nt] mask. This can be large; for prototypes it's OK. For scale, do chunking.
         n_q = len(train_ids_ordered)
         n_t = len(train_ids)
         mask_self = torch.zeros((n_q, n_t), dtype=torch.bool, device=train_gnn_embs.device)
@@ -348,11 +394,10 @@ def build_knn_prompt_dataset(
         k=k,
         mask_self=mask_self,
     )
-
     top_idx = top_idx.cpu().tolist()
 
-    prompts = []
-    references = []
+    prompts: List[List[Dict[str, str]]] = []
+    references: List[str] = []
 
     n = len(train_ids_ordered)
     if max_samples is not None:
@@ -360,23 +405,221 @@ def build_knn_prompt_dataset(
 
     for i in range(n):
         qid = train_ids_ordered[i]
+
         neighbor_ids = [train_ids[j] for j in top_idx[i]]
         neighbor_descs = [train_id2desc.get(nid, "") for nid in neighbor_ids]
-        ptxt = build_prompt(neighbor_descs)
+        neighbor_cards = [train_id2card.get(nid, "") for nid in neighbor_ids]
+
+        query_card = train_id2card.get(qid, "")
+
+        ptxt = build_prompt(query_card, neighbor_descs, neighbor_cards)
         prompts.append(prompt_as_chat(ptxt))
         references.append(train_id2desc.get(qid, ""))
 
     return Dataset.from_dict({"prompt": prompts, "reference": references})
 
+# --------------------------------------------------------------------------------------
+# Supervised Fine Tuning (SFT) on the KNN dataset
+# --------------------------------------------------------------------------------------
+
+def _render_prompt_for_sft(tokenizer, prompt_messages: List[Dict[str, str]]) -> str:
+    """
+    Convert a chat-style prompt (list of {role, content}) into a plain text string
+    for supervised fine-tuning. Uses the tokenizer chat template if available; otherwise
+    concatenates messages.
+    """
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        # No generation prompt here; SFT will append target separately
+        return tokenizer.apply_chat_template(
+            prompt_messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    # Fallback: simple linearization
+    parts = []
+    for m in prompt_messages:
+        role = (m.get("role", "user") or "user").upper()
+        parts.append(f"{role}: {m.get('content','')}")
+    parts.append("ASSISTANT:")
+    return "\n".join(parts)
+
+
+def sft_finetune_on_knn(
+    base_model_name_or_path: str,
+    output_dir: str,
+    train_dataset: Dataset,  # expects columns: "prompt" (chat messages), "reference" (string)
+    device: str,
+    use_lora: bool = True,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    max_prompt_length: int = 1024,
+    max_completion_length: int = 192,
+    num_train_steps: int = 800,
+    per_device_train_batch_size: int = 2,
+    gradient_accumulation_steps: int = 4,
+    learning_rate: float = 2e-5,
+    bf16: bool = False,
+    fp16: bool = True,
+    seed: int = 42,
+) -> str:
+    """
+    Supervised fine-tuning (SFT) stage on the KNN prompt dataset.
+    Produces an intermediate model directory to be used as the starting policy for RL.
+
+    Works for:
+      - decoder-only (CausalLM) models
+      - encoder-decoder (Seq2SeqLM) models
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    config = AutoConfig.from_pretrained(base_model_name_or_path)
+    torch_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
+    device_map = "auto" if torch.cuda.is_available() else None
+
+    if config.is_encoder_decoder:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            base_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_name_or_path,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+        )
+
+    if use_lora:
+        lora_cfg = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM",
+            target_modules="all-linear",
+        )
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()
+
+    # ----------------------------
+    # Tokenization: build training examples
+    # ----------------------------
+    def _tokenize_row(ex):
+        prompt_msgs = ex["prompt"]
+        ref = ex["reference"] or ""
+
+        if config.is_encoder_decoder:
+            # Seq2Seq: encode prompt as input, reference as target
+            prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
+            model_inputs = tokenizer(
+                prompt_text,
+                max_length=max_prompt_length,
+                truncation=True,
+            )
+            with tokenizer.as_target_tokenizer():
+                labels = tokenizer(
+                    ref,
+                    max_length=max_completion_length,
+                    truncation=True,
+                )["input_ids"]
+            model_inputs["labels"] = labels
+            return model_inputs
+
+        # CausalLM: encode (prompt + reference) and mask prompt tokens from loss
+        prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
+        full_text = prompt_text + " " + ref
+
+        prompt_ids = tokenizer(
+            prompt_text,
+            max_length=max_prompt_length,
+            truncation=True,
+            add_special_tokens=False,
+        )["input_ids"]
+
+        full = tokenizer(
+            full_text,
+            max_length=max_prompt_length + max_completion_length,
+            truncation=True,
+            add_special_tokens=True,
+        )
+
+        labels = full["input_ids"].copy()
+        # mask the prompt portion
+        cut = min(len(prompt_ids), len(labels))
+        for i in range(cut):
+            labels[i] = -100
+
+        full["labels"] = labels
+        return full
+
+    tokenized = train_dataset.map(
+        _tokenize_row,
+        remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "reference")],
+    )
+
+    # ----------------------------
+    # Collator (pad inputs + labels)
+    # ----------------------------
+    def _collate(features):
+        batch = tokenizer.pad(
+            features,
+            padding=True,
+            return_tensors="pt",
+        )
+        # Ensure labels are padded to -100
+        if "labels" in batch:
+            labels = batch["labels"]
+            labels[labels == tokenizer.pad_token_id] = -100
+            batch["labels"] = labels
+        return batch
+
+    # ----------------------------
+    # Train
+    # ----------------------------
+    args = TrainingArguments(
+        output_dir=output_dir,
+        max_steps=num_train_steps,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        logging_steps=20,
+        save_steps=200,
+        save_total_limit=2,
+        bf16=bf16,
+        fp16=(fp16 and not bf16),
+        report_to=[],
+        seed=seed,
+        remove_unused_columns=False,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=tokenized,
+        data_collator=_collate,
+        tokenizer=tokenizer,
+    )
+    trainer.train()
+
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    return output_dir
 
 # --------------------------------------------------------------------------------------
-# GRPO fine-tuning
+# RL fine-tuning
 # --------------------------------------------------------------------------------------
 def finetune_base_model(
     base_model_name_or_path: str,
     output_dir: str,
     train_dataset: Dataset,
     device: str,
+    rl_algo: str = "grpo",  # user-selectable: "grpo" or "ppo"
     use_lora: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32,
@@ -386,7 +629,7 @@ def finetune_base_model(
     num_train_steps: int = 500,
     per_device_train_batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
-    num_generations: int = 4,
+    num_generations: int = 4,  # GRPO only
     learning_rate: float = 5e-6,
     bf16: bool = False,
     fp16: bool = True,
@@ -394,66 +637,224 @@ def finetune_base_model(
     bert_reward_batch_size: int = 16,
 ) -> str:
     """
-    Fine-tune a small LLM with GRPO.
+    Fine-tune with GRPO or PPO (user-selectable).
 
-    Returns:
-      path to saved model directory.
+    Notes:
+      - GRPO path expects TRL GRPOTrainer behavior.
+      - PPO path uses TRL PPOTrainer and requires a value head (TRL wrapper).
+      - For PPO, we linearize chat-style prompts to plain text (model-agnostic).
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    rl_algo = (rl_algo or "grpo").strip().lower()
+    if rl_algo not in {"grpo", "ppo"}:
+        raise ValueError(f"Unsupported rl_algo={rl_algo}. Expected 'grpo' or 'ppo'.")
+
     tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True)
     if tokenizer.pad_token is None:
-        # Most causal LMs need an explicit pad token; eos is typical.
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model_name_or_path,
-        dtype=torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32),
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    config = AutoConfig.from_pretrained(base_model_name_or_path)
 
+    torch_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
+    device_map = "auto" if torch.cuda.is_available() else None
+
+    # ----------------------------
+    # Load model(s)
+    # ----------------------------
+    if rl_algo == "ppo":
+        # PPO needs value head + ref_model for KL control
+        if config.is_encoder_decoder:
+            model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(
+                base_model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+            )
+            ref_model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(
+                base_model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+            )
+        else:
+            model = AutoModelForCausalLMWithValueHead.from_pretrained(
+                base_model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+            )
+            ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+                base_model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+            )
+    else:
+        # GRPO (no value head)
+        if config.is_encoder_decoder:
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                base_model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model_name_or_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+            )
+
+    # ----------------------------
+    # Optional LoRA
+    # ----------------------------
     if use_lora:
         lora_cfg = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             bias="none",
-            task_type="CAUSAL_LM",
-            target_modules="all-linear",  # good default for many modern architectures
+            task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM",
+            target_modules="all-linear",
         )
         model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
 
+        if rl_algo == "ppo":
+            # ref_model stays frozen; no LoRA there
+            pass
+
+    # ----------------------------
+    # Reward function (reuse existing)
+    # ----------------------------
     reward_fn = make_reward_fn(device=device, bert_batch_size=bert_reward_batch_size)
 
-    training_args = GRPOConfig(
-        output_dir=output_dir,
-        learning_rate=learning_rate,
-        max_steps=num_train_steps,
-        per_device_train_batch_size=per_device_train_batch_size,
+    # ----------------------------
+    # Train
+    # ----------------------------
+    if rl_algo == "grpo":
+        training_args = GRPOConfig(
+            output_dir=output_dir,
+            learning_rate=learning_rate,
+            max_steps=num_train_steps,
+            per_device_train_batch_size=per_device_train_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            num_generations=num_generations,
+            max_prompt_length=max_prompt_length,
+            max_completion_length=max_completion_length,
+            bf16=bf16,
+            fp16=fp16 if not bf16 else False,
+            logging_steps=10,
+            save_steps=100,
+            seed=seed,
+            report_to=[],
+        )
+
+        trainer = GRPOTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            reward_funcs=reward_fn,
+        )
+
+        trainer.train()
+        trainer.save_model(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        return output_dir
+
+    # ----------------------------
+    # PPO path
+    # ----------------------------
+    def _prompt_to_text(p):
+        if isinstance(p, str):
+            return p
+        if isinstance(p, list):
+            # list[{"role","content"}] -> plain text
+            parts = []
+            for m in p:
+                role = (m.get("role", "user") or "user").upper()
+                content = m.get("content", "")
+                parts.append(f"{role}: {content}")
+            parts.append("ASSISTANT:")
+            return "\n".join(parts)
+        return str(p)
+
+    # Ensure PPO sees plain text prompts
+    if "prompt" in train_dataset.column_names:
+        train_dataset = train_dataset.map(lambda ex: {"prompt": _prompt_to_text(ex["prompt"])})
+    else:
+        raise ValueError("PPO requires a 'prompt' column in train_dataset.")
+
+    if "reference" not in train_dataset.column_names:
+        raise ValueError("PPO path expects a 'reference' column for reward computation.")
+
+    ppo_cfg = PPOConfig(
+        batch_size=per_device_train_batch_size,
+        mini_batch_size=max(1, per_device_train_batch_size // max(1, gradient_accumulation_steps)),
         gradient_accumulation_steps=gradient_accumulation_steps,
-        num_generations=num_generations,
-        max_prompt_length=max_prompt_length,
-        max_completion_length=max_completion_length,
-        bf16=bf16,
-        fp16=fp16 if not bf16 else False,
-        logging_steps=10,
-        save_steps=100,
+        learning_rate=learning_rate,
         seed=seed,
-        report_to=[],
+        log_with=None,
+        optimize_cuda_cache=True,
     )
 
-    trainer = GRPOTrainer(
+    def _collate(batch):
+        prompts = [b["prompt"] for b in batch]
+        refs = [b["reference"] for b in batch]
+        enc = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_prompt_length,
+        )
+        enc["reference_text"] = refs  # keep raw strings for reward
+        return enc
+
+    trainer = PPOTrainer(
+        config=ppo_cfg,
         model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        reward_funcs=reward_fn,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        dataset=train_dataset,
+        data_collator=_collate,
     )
 
-    trainer.train()
-    trainer.save_model(output_dir)
-    tokenizer.save_pretrained(output_dir)
+    gen_kwargs = dict(
+        max_new_tokens=max_completion_length,
+        do_sample=True,
+        top_p=0.9,
+        temperature=0.8,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
 
+    step = 0
+    for batch in trainer.dataloader:
+        if step >= num_train_steps:
+            break
+
+        query_tensors = batch["input_ids"].to(trainer.accelerator.device)
+        attention_mask = batch.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(trainer.accelerator.device)
+
+        response_tensors = trainer.generate(
+            query_tensors,
+            attention_mask=attention_mask,
+            **gen_kwargs,
+        )
+
+        responses_dec = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+        refs = batch["reference_text"]
+
+        # Adapt to existing reward_fn signature: completions is list[list[{role,content}]]
+        completions = [[{"role": "assistant", "content": r}] for r in responses_dec]
+        reward_vals = reward_fn(completions=completions, reference=refs)
+        rewards = [torch.tensor(r, device=trainer.accelerator.device) for r in reward_vals]
+
+        trainer.step(query_tensors, response_tensors, rewards)
+        step += 1
+
+    trainer.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
     return output_dir
 
 
@@ -477,20 +878,18 @@ def generate_desc(
     top_p: float = 0.9,
     do_sample: bool = True,
     evaluate: bool = False,
-) -> pd.DataFrame:
-    """
-    On query data (validation/test):
-      1) Embed using GNN
-      2) Find K nearest from train
-      3) Create prompt (for all samples)
-      4) Batch generate with the (fine-tuned) LLM
-    """
-    # Load train pool
+    ) -> pd.DataFrame:
+    # Load train pool (descriptions + embeddings + mol_cards)
     train_id2desc = load_descriptions_from_graphs(train_graphs)
+    train_id2card = load_mol_cards_from_graphs(train_graphs)
+
     train_id2emb = load_id2emb(train_emb_csv)
     train_ids = list(train_id2emb.keys())
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
+
+    # Load query mol_cards (from pickle if present; else compute fallback)
+    query_id2card = load_mol_cards_from_graphs(query_graphs)
 
     # Encode query
     query_embs, query_ids = encode_graphs(gnn_model, query_graphs, device=device, batch_size=encode_batch_size)
@@ -505,9 +904,15 @@ def generate_desc(
     sims_all: List[List[float]] = []
 
     for i in range(len(query_ids)):
+        qid = query_ids[i]
+
         nn_ids = [train_ids[j] for j in top_idx[i]]
         nn_descs = [train_id2desc.get(nid, "") for nid in nn_ids]
-        prompts_text.append(build_prompt(nn_descs))
+        nn_cards = [train_id2card.get(nid, "") for nid in nn_ids]
+
+        query_card = query_id2card.get(qid, "")
+
+        prompts_text.append(build_prompt(query_card, nn_descs, nn_cards))
         nn_ids_all.append(nn_ids)
         sims_all.append([float(s) for s in top_sims[i]])
 
@@ -619,7 +1024,7 @@ def main():
     # LLM
     parser.add_argument(
         "--base_llm",
-        default="Qwen/Qwen2-0.5B-Instruct",
+        default="QizhiPei/biot5-plus-base",
         type=str,
         help="HF model name/path (<=1B recommended).",
     )
@@ -628,16 +1033,27 @@ def main():
     # Actions
     parser.add_argument("--do_finetune", action="store_true", help="Run GRPO fine-tuning")
     parser.add_argument("--do_generate", action="store_true", help="Run generation on a split")
+    parser.add_argument("--do_sft", action="store_true", help="Run SFT on the KNN dataset before RL")
+    
+    # SFT params
+    parser.add_argument("--sft_steps", default=800, type=int)
+    parser.add_argument("--sft_lr", default=2e-5, type=float)
 
     # Generation split
     parser.add_argument("--split", default="test", choices=["validation", "val", "test"])
     parser.add_argument("--gen_batch_size", default=8, type=int)
     parser.add_argument("--max_new_tokens", default=192, type=int)
 
-    # GRPO params (prototype defaults)
+    parser.add_argument(
+        "--rl_algo",
+        default="ppo",
+        choices=["grpo", "ppo"],
+        help="RL algorithm: grpo or ppo (seq2seq-friendly).",
+    )
+    # RL params (prototype defaults)
     parser.add_argument("--steps", default=300, type=int)
-    parser.add_argument("--lr", default=5e-6, type=float)
-    parser.add_argument("--per_device_bs", default=16, type=int)
+    parser.add_argument("--lr", default=1e-5, type=float)
+    parser.add_argument("--per_device_bs", default=2, type=int)
     parser.add_argument("--grad_accum", default=4, type=int)
     parser.add_argument("--num_generations", default=4, type=int)
     parser.add_argument("--use_lora", action="store_true", help="Use LoRA adapters (recommended)")
@@ -683,8 +1099,8 @@ def main():
     use_lora = args.use_lora and (not args.no_lora)
 
     if args.do_finetune:
-        print("Building RL dataset from TRAIN split (leave-one-out KNN)...")
-        rl_ds = build_knn_prompt_dataset(
+        print("Building KNN dataset from TRAIN split (leave-one-out KNN)...")
+        knn_ds = build_knn_prompt_dataset(
             gnn_model=gnn,
             train_graphs=TRAIN_GRAPHS,
             train_emb_csv=TRAIN_EMB_CSV,
@@ -694,12 +1110,35 @@ def main():
             max_samples=args.max_train_samples,
             leave_one_out=True,
         )
-        print(f"RL dataset size: {len(rl_ds)}")
+        print(f"KNN dataset size: {len(knn_ds)}")
 
+        start_model = args.base_llm
+
+        if args.do_sft:
+            sft_dir = str(base_path / (args.out_llm_dir + "_sft"))
+            print(f"Running SFT -> {sft_dir}")
+            start_model = sft_finetune_on_knn(
+                base_model_name_or_path=args.base_llm,
+                output_dir=sft_dir,
+                train_dataset=knn_ds,
+                device=device,
+                use_lora=use_lora,
+                num_train_steps=args.sft_steps,
+                learning_rate=args.sft_lr,
+                per_device_train_batch_size=args.per_device_bs,
+                gradient_accumulation_steps=args.grad_accum,
+                max_prompt_length=1024,
+                max_completion_length=args.max_new_tokens,
+                bf16=False,
+                fp16=torch.cuda.is_available(),
+            )
+            print(f"SFT model saved to: {start_model}")
+
+        print("Running RL fine-tuning...")
         llm_dir = finetune_base_model(
-            base_model_name_or_path=args.base_llm,
+            base_model_name_or_path=start_model,  # NOTE: SFT output if --do_sft, else base_llm
             output_dir=str((base_path / args.out_llm_dir)),
-            train_dataset=rl_ds,
+            train_dataset=knn_ds,
             device=device,
             use_lora=use_lora,
             num_train_steps=args.steps,

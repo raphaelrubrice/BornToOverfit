@@ -4,11 +4,12 @@
 import pickle
 import pandas as pd
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, T5EncoderModel, T5ForConditionalGeneration
 from tqdm import tqdm
 from pathlib import Path
 import os
 from argparse import ArgumentParser
+TRANSFORMERS_VERBOSITY='info'
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -46,11 +47,18 @@ if __name__ == "__main__":
 
     print(f"Loading model: {args.base_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
-    model = AutoModel.from_pretrained(
+    if "t5" in args.base_model:
+        model = T5EncoderModel.from_pretrained(
         args.base_model,
         output_hidden_states=True,
         return_dict=True
-    )
+        )
+    else:
+      model = AutoModel.from_pretrained(
+          args.base_model,
+          output_hidden_states=True,
+          return_dict=True
+      )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -115,4 +123,3 @@ if __name__ == "__main__":
         print(f"Saved to {output_path}")
 
     print("\nDone!")
-
