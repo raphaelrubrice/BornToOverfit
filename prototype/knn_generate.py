@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+knn_generate.py
+
+kNN + LLM generation with GRPO fine-tuning (TRL).
+
+Key design choices:
+- Retrieval/prompting uses your existing GNN embedding space (MolGNN) + train text embeddings.
+- Base generative model: a light modern HF instruct model (<= 1B params) by default:
+    "Qwen/Qwen2-0.5B-Instruct"
+- Fine-tuning: TRL's GRPOTrainer (Group Relative Policy Optimization).
+- Reward: heavy penalty if not exact match, plus informative shaping using BLEU-F1 + BERTScore(roberta-base).
+
+This file contains:
+  - finetune_base_model(...) : GRPO post-training on a kNN-prompt-to-description task
+  - generate_desc(...)       : batch generation on validation/test
+  - a CLI entrypoint to run finetuning and/or generation.
+
+Dependencies:
+  pip install -U transformers datasets accelerate trl peft sacrebleu bert-score
+
+Notes:
+- GRPO is online RL; reward functions must be efficient. BERTScore is expensive; this prototype uses
+  batched computation and suggests small batch sizes.
+- This is a prototype. For serious training runs: use LoRA, bf16/fp16, gradient checkpointing,
+  and consider running reward metrics on a subset or replacing BERTScore with a learned reward model.
+
+"""
+
+import os
+import re
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from argparse import ArgumentParser
+from typing import Dict, List, Tuple, Optional
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from datasets import Dataset
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    GenerationConfig,
+)
+
+from peft import LoraConfig, get_peft_model
+
+from trl import GRPOTrainer, GRPOConfig
+
+import sacrebleu
+from bert_score import score as bertscore
+
+from data_utils import (
+    load_id2emb,
+    load_descriptions_from_graphs,
+    PreprocessedGraphDataset,
+    collate_fn,
+)
+from train_gcn import MolGNN
+
+_EVAL_AVAILABLE = True
+try:
+    from retrieval_answer import evaluate_retrieval_text_metrics  # :contentReference[oaicite:0]{index=0}
+except Exception:
+    _EVAL_AVAILABLE = False
+
+# --------------------------------------------------------------------------------------
+# Prompting utilities
+# --------------------------------------------------------------------------------------
+def build_prompt(neighbor_descs: List[str]) -> str:
+    lines = []
+    lines.append("Here are the descriptions of the K nearest molecules to the query molecule from nearest to furthest.")
+    for d in neighbor_descs:
+        lines.append(d)
+    lines.append("Based on previous descriptions, generate the accurate description of the query molecule.")
+    return "\n".join(lines)
+
+
+def prompt_as_chat(prompt_text: str) -> List[Dict[str, str]]:
+    """
+    Return a chat-style prompt in the format used by instruct chat models in TRL docs:
+      [{"role": "user", "content": "..."}]
+    """
+    return [{"role": "user", "content": prompt_text}]
+
+
+# --------------------------------------------------------------------------------------
+# GNN encoding + KNN retrieval
+# --------------------------------------------------------------------------------------
+@torch.no_grad()
+def encode_graphs(model: MolGNN, graph_pkl: str, device: str, batch_size: int = 64) -> Tuple[torch.Tensor, List[str]]:
+    ds = PreprocessedGraphDataset(graph_pkl)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+    all_embs: List[torch.Tensor] = []
+    all_ids: List[str] = []
+
+    for graphs in dl:
+        graphs = graphs.to(device)
+        mol_emb = model(graphs)
+        mol_emb = F.normalize(mol_emb, dim=-1)
+        all_embs.append(mol_emb)
+
+        bs = graphs.num_graphs
+        start_idx = len(all_ids)
+        all_ids.extend(ds.ids[start_idx:start_idx + bs])
+
+    embs = torch.cat(all_embs, dim=0)
+    return embs, all_ids
+
+
+def knn_topk(
+    query_embs_norm: torch.Tensor,
+    train_embs_norm: torch.Tensor,
+    k: int,
+    mask_self: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      top_idx: [Nq, k]
+      top_sims: [Nq, k]
+    mask_self:
+      Optional boolean mask [Nq, Nt] where True positions are disallowed (set sim=-inf).
+      Used for leave-one-out on training.
+    """
+    sims = query_embs_norm @ train_embs_norm.t()  # [Nq, Nt]
+    if mask_self is not None:
+        sims = sims.masked_fill(mask_self, float("-inf"))
+
+    k_eff = min(k, sims.size(1))
+    top_sims, top_idx = torch.topk(sims, k=k_eff, dim=-1, largest=True, sorted=True)
+    return top_idx, top_sims
+
+
+# --------------------------------------------------------------------------------------
+# Rewards: BLEU-F1 + BERTScore(roberta-base) + exact match penalty
+# --------------------------------------------------------------------------------------
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = _WS_RE.sub(" ", s)
+    return s
+
+
+def bleu_f1_corpus(preds: List[str], refs: List[str], tokenize: str = "13a") -> float:
+    """
+    BLEU-F1 in [0, 1].
+      precision proxy: BLEU(preds, refs)
+      recall proxy:    BLEU(refs, preds)
+    """
+    preds = [p.lower() for p in preds]
+    refs = [r.lower() for r in refs]
+    bleu_p = sacrebleu.corpus_bleu(preds, [refs], tokenize=tokenize).score
+    bleu_r = sacrebleu.corpus_bleu(refs, [preds], tokenize=tokenize).score
+    denom = (bleu_p + bleu_r)
+    bleu_f1 = (2.0 * bleu_p * bleu_r / denom) if denom > 0 else 0.0
+    return float(bleu_f1 / 100.0)
+
+
+@torch.no_grad()
+def bertscore_f1_roberta_base(
+    preds: List[str],
+    refs: List[str],
+    device: str,
+    batch_size: int = 32,
+) -> float:
+    """
+    Mean BERTScore F1 in [0, 1], using roberta-base.
+    """
+    P, R, F1 = bertscore(
+        cands=preds,
+        refs=refs,
+        model_type="roberta-base",
+        lang="en",
+        device=device,
+        batch_size=batch_size,
+        idf=False,
+        verbose=False,
+        rescale_with_baseline=False,
+    )
+    return float(F1.mean().item())
+
+
+def make_reward_fn(
+    device: str,
+    bleu_weight: float = 0.45,
+    bert_weight: float = 0.55,
+    exact_bonus: float = 1.0,
+    exact_penalty: float = 1.0,
+    bert_batch_size: int = 32,
+):
+    """
+    TRL GRPO reward function.
+
+    TRL passes:
+      completions: list[list[dict]] where completion[0]["content"] is the generated text
+      plus any dataset columns as kwargs, e.g. reference=[...]
+    """
+
+    def reward_fn(completions, reference, **kwargs):
+        # completions length = batch_size * num_generations_per_prompt (GRPO uses groups)
+        pred_texts = [c[0]["content"] for c in completions]
+        refs = list(reference)
+
+        # Ensure alignment
+        if len(pred_texts) != len(refs):
+            # TRL should align these; if not, best-effort truncate
+            n = min(len(pred_texts), len(refs))
+            pred_texts = pred_texts[:n]
+            refs = refs[:n]
+
+        # Exact-match shaping
+        exact = []
+        for p, r in zip(pred_texts, refs):
+            exact.append(1 if _normalize_text(p) == _normalize_text(r) and len(_normalize_text(r)) > 0 else 0)
+
+        # Metric shaping
+        # BLEU-F1 computed at corpus-level across the batch; broadcast to each example
+        bleu = bleu_f1_corpus(pred_texts, refs)  # scalar
+        # BERTScore across the batch; scalar
+        bert = bertscore_f1_roberta_base(pred_texts, refs, device=device, batch_size=bert_batch_size)  # scalar
+
+        rewards = []
+        for ex in exact:
+            em_term = (exact_bonus if ex == 1 else -exact_penalty)
+            shaped = (bleu_weight * bleu) + (bert_weight * bert)
+            rewards.append(float(em_term + shaped))
+
+        # Optional: clip reward to stabilize
+        rewards = [max(-2.0, min(2.0, r)) for r in rewards]
+        return rewards
+
+    return reward_fn
+
+
+# --------------------------------------------------------------------------------------
+# Build RL dataset: prompts from KNN, references from ground truth
+# --------------------------------------------------------------------------------------
+@torch.no_grad()
+def build_knn_prompt_dataset(
+    gnn_model: MolGNN,
+    train_graphs: str,
+    train_emb_csv: str,
+    device: str,
+    k: int,
+    encode_batch_size: int,
+    max_samples: Optional[int] = None,
+    leave_one_out: bool = True,
+) -> Dataset:
+    """
+    Create a Dataset with columns:
+      - prompt:    chat-style messages (list[{"role","content"}])
+      - reference: ground-truth description (string)
+
+    We use TRAIN split for RL prompts. For each train molecule, we retrieve K neighbors from the
+    same train set. If leave_one_out=True, we disallow selecting itself.
+    """
+    # Load train text embeddings (targets of GNN)
+    train_id2emb = load_id2emb(train_emb_csv)
+    train_ids = list(train_id2emb.keys())
+    train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
+    train_embs = F.normalize(train_embs, dim=-1)
+
+    # Load descriptions
+    train_id2desc = load_descriptions_from_graphs(train_graphs)
+
+    # Encode training graphs with GNN
+    train_gnn_embs, train_ids_ordered = encode_graphs(gnn_model, train_graphs, device=device, batch_size=encode_batch_size)
+
+    # Align to embeddings CSV order:
+    # The embeddings CSV may have a different order from PreprocessedGraphDataset ids.
+    # We will build a mapping from train_ids->index in train_embs for retrieval
+    id_to_trainemb_index = {tid: idx for idx, tid in enumerate(train_ids)}
+    # We also need train_embs aligned to train_ids_ordered (query side retrieval uses train_embs pool)
+    # Retrieval pool stays as (train_ids, train_embs). Query embeddings correspond to train_ids_ordered.
+
+    # Leave-one-out mask
+    mask_self = None
+    if leave_one_out:
+        # Build [Nq, Nt] mask. This can be large; for prototypes it's OK. For scale, do chunking.
+        n_q = len(train_ids_ordered)
+        n_t = len(train_ids)
+        mask_self = torch.zeros((n_q, n_t), dtype=torch.bool, device=train_gnn_embs.device)
+        for i, qid in enumerate(train_ids_ordered):
+            j = id_to_trainemb_index.get(qid, None)
+            if j is not None:
+                mask_self[i, j] = True
+
+    top_idx, _top_sims = knn_topk(
+        query_embs_norm=train_gnn_embs,
+        train_embs_norm=train_embs,
+        k=k,
+        mask_self=mask_self,
+    )
+
+    top_idx = top_idx.cpu().tolist()
+
+    prompts = []
+    references = []
+
+    n = len(train_ids_ordered)
+    if max_samples is not None:
+        n = min(n, int(max_samples))
+
+    for i in range(n):
+        qid = train_ids_ordered[i]
+        neighbor_ids = [train_ids[j] for j in top_idx[i]]
+        neighbor_descs = [train_id2desc.get(nid, "") for nid in neighbor_ids]
+        ptxt = build_prompt(neighbor_descs)
+        prompts.append(prompt_as_chat(ptxt))
+        references.append(train_id2desc.get(qid, ""))
+
+    return Dataset.from_dict({"prompt": prompts, "reference": references})
+
+
+# --------------------------------------------------------------------------------------
+# GRPO fine-tuning
+# --------------------------------------------------------------------------------------
+def finetune_base_model(
+    base_model_name_or_path: str,
+    output_dir: str,
+    train_dataset: Dataset,
+    device: str,
+    use_lora: bool = True,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    max_prompt_length: int = 1024,
+    max_completion_length: int = 192,
+    num_train_steps: int = 500,
+    per_device_train_batch_size: int = 2,
+    gradient_accumulation_steps: int = 4,
+    num_generations: int = 4,
+    learning_rate: float = 5e-6,
+    bf16: bool = False,
+    fp16: bool = True,
+    seed: int = 42,
+    bert_reward_batch_size: int = 16,
+) -> str:
+    """
+    Fine-tune a small LLM with GRPO.
+
+    Returns:
+      path to saved model directory.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True)
+    if tokenizer.pad_token is None:
+        # Most causal LMs need an explicit pad token; eos is typical.
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_name_or_path,
+        torch_dtype=torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32),
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+
+    if use_lora:
+        lora_cfg = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules="all-linear",  # good default for many modern architectures
+        )
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()
+
+    reward_fn = make_reward_fn(device=device, bert_batch_size=bert_reward_batch_size)
+
+    training_args = GRPOConfig(
+        output_dir=output_dir,
+        learning_rate=learning_rate,
+        max_steps=num_train_steps,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        num_generations=num_generations,
+        max_prompt_length=max_prompt_length,
+        max_completion_length=max_completion_length,
+        bf16=bf16,
+        fp16=fp16 if not bf16 else False,
+        logging_steps=10,
+        save_steps=100,
+        seed=seed,
+        report_to=[],
+    )
+
+    trainer = GRPOTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        train_dataset=train_dataset,
+        reward_funcs=reward_fn,
+    )
+
+    trainer.train()
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+    return output_dir
+
+
+# --------------------------------------------------------------------------------------
+# Generation on validation/test: retrieval -> prompt -> batch generate
+# --------------------------------------------------------------------------------------
+@torch.no_grad()
+def generate_desc(
+    gnn_model: MolGNN,
+    llm_dir_or_name: str,
+    train_graphs: str,
+    query_graphs: str,
+    train_emb_csv: str,
+    device: str,
+    k: int,
+    out_csv: str,
+    encode_batch_size: int = 64,
+    gen_batch_size: int = 8,
+    max_new_tokens: int = 192,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    do_sample: bool = True,
+    evaluate: bool = False,
+) -> pd.DataFrame:
+    """
+    On query data (validation/test):
+      1) Embed using GNN
+      2) Find K nearest from train
+      3) Create prompt (for all samples)
+      4) Batch generate with the (fine-tuned) LLM
+    """
+    # Load train pool
+    train_id2desc = load_descriptions_from_graphs(train_graphs)
+    train_id2emb = load_id2emb(train_emb_csv)
+    train_ids = list(train_id2emb.keys())
+    train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
+    train_embs = F.normalize(train_embs, dim=-1)
+
+    # Encode query
+    query_embs, query_ids = encode_graphs(gnn_model, query_graphs, device=device, batch_size=encode_batch_size)
+
+    # Retrieve KNN
+    top_idx, top_sims = knn_topk(query_embs, train_embs, k=k)
+    top_idx = top_idx.cpu().tolist()
+    top_sims = top_sims.cpu().tolist()
+
+    prompts_text: List[str] = []
+    nn_ids_all: List[List[str]] = []
+    sims_all: List[List[float]] = []
+
+    for i in range(len(query_ids)):
+        nn_ids = [train_ids[j] for j in top_idx[i]]
+        nn_descs = [train_id2desc.get(nid, "") for nid in nn_ids]
+        prompts_text.append(build_prompt(nn_descs))
+        nn_ids_all.append(nn_ids)
+        sims_all.append([float(s) for s in top_sims[i]])
+
+    # Load LLM
+    tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    llm = AutoModelForCausalLM.from_pretrained(
+        llm_dir_or_name,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+    llm.eval()
+
+    gen_cfg = GenerationConfig(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    # Batch generation
+    generations: List[str] = []
+    for start in range(0, len(prompts_text), gen_batch_size):
+        batch_prompts = prompts_text[start:start + gen_batch_size]
+
+        # For instruct chat models, apply chat template if available
+        if hasattr(tokenizer, "apply_chat_template"):
+            batch_msgs = [prompt_as_chat(p) for p in batch_prompts]
+            input_ids = tokenizer.apply_chat_template(
+                batch_msgs,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to(llm.device)
+            attention_mask = (input_ids != tokenizer.pad_token_id).long()
+            outputs = llm.generate(input_ids=input_ids, attention_mask=attention_mask, generation_config=gen_cfg)
+            # Strip the prompt portion
+            gen_only = outputs[:, input_ids.shape[1]:]
+            texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+        else:
+            enc = tokenizer(
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to(llm.device)
+            outputs = llm.generate(**enc, generation_config=gen_cfg)
+            gen_only = outputs[:, enc["input_ids"].shape[1]:]
+            texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
+        generations.extend([t.strip() for t in texts])
+
+    # Write CSV
+    rows = []
+    for i, qid in enumerate(query_ids):
+        row = {
+            "ID": qid,
+            "Prompt": prompts_text[i],
+            "generated_description": generations[i],
+        }
+        for j in range(len(nn_ids_all[i])):
+            row[f"NN{j+1}"] = nn_ids_all[i][j]
+            row[f"SIM{j+1}"] = sims_all[i][j]
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    os.makedirs(str(Path(out_csv).parent), exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"Saved generations to: {out_csv}")
+
+    df.to_csv(out_csv, index=False)
+    print(f"Saved generations to: {out_csv}")
+
+    # Optional evaluation (intended for validation split where references exist)
+    if evaluate:
+        if not _EVAL_AVAILABLE:
+            print("WARNING: Evaluation requested but retrieval_answer.evaluate_retrieval_text_metrics is not available.")
+        else:
+            query_id2desc = load_descriptions_from_graphs(query_graphs)
+            metrics_path = str(Path(out_csv).with_suffix(".metrics.json"))
+            eval_df = df[["ID", "generated_description"]].rename(columns={"generated_description": "description"})
+            evaluate_retrieval_text_metrics(
+                results_df=eval_df,
+                test_id2desc=query_id2desc,
+                device=device,
+                save_path=metrics_path,
+            )
+
+    return df
+
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+def main():
+    parser = ArgumentParser()
+    parser.add_argument("-f_data", default="data_baseline/data", type=str, help="Folder containing *graphs.pkl files")
+    parser.add_argument("-f", default="data_baseline/data", type=str, help="Folder containing embeddings/model checkpoint")
+    parser.add_argument("--k", default=5, type=int)
+    parser.add_argument("--encode_batch_size", default=64, type=int)
+    parser.add_argument("--max_train_samples", default=None, type=int, help="Limit RL dataset size for quick prototyping")
+
+    # LLM
+    parser.add_argument(
+        "--base_llm",
+        default="Qwen/Qwen2-0.5B-Instruct",
+        type=str,
+        help="HF model name/path (<=1B recommended).",
+    )
+    parser.add_argument("--out_llm_dir", default="knn_llm_grpo", type=str, help="Where to save the fine-tuned model")
+
+    # Actions
+    parser.add_argument("--do_finetune", action="store_true", help="Run GRPO fine-tuning")
+    parser.add_argument("--do_generate", action="store_true", help="Run generation on a split")
+
+    # Generation split
+    parser.add_argument("--split", default="test", choices=["validation", "val", "test"])
+    parser.add_argument("--gen_batch_size", default=8, type=int)
+    parser.add_argument("--max_new_tokens", default=192, type=int)
+
+    # GRPO params (prototype defaults)
+    parser.add_argument("--steps", default=300, type=int)
+    parser.add_argument("--lr", default=5e-6, type=float)
+    parser.add_argument("--per_device_bs", default=2, type=int)
+    parser.add_argument("--grad_accum", default=4, type=int)
+    parser.add_argument("--num_generations", default=4, type=int)
+    parser.add_argument("--use_lora", action="store_true", help="Use LoRA adapters (recommended)")
+    parser.add_argument("--no_lora", action="store_true", help="Disable LoRA")
+
+    # Reward speed
+    parser.add_argument("--bert_reward_bs", default=16, type=int, help="BERTScore batch size inside reward")
+
+    args = parser.parse_args()
+
+    # Resolve paths
+    file_path = Path(os.path.abspath(__file__))
+    parent_folder = file_path.parent
+
+    data_path = parent_folder.parent / args.f_data
+    base_path = parent_folder.parent / args.f
+
+    TRAIN_GRAPHS = str(data_path / "train_graphs.pkl")
+    VAL_GRAPHS = str(data_path / "validation_graphs.pkl")
+    TEST_GRAPHS = str(data_path / "test_graphs.pkl")
+
+    MODEL_PATH = str(base_path / "model_checkpoint.pt")
+    TRAIN_EMB_CSV = str(base_path / "train_embeddings.csv")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+
+    for p in [TRAIN_GRAPHS, MODEL_PATH, TRAIN_EMB_CSV]:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Missing required file: {p}")
+
+    # Load GNN
+    train_id2emb = load_id2emb(TRAIN_EMB_CSV)
+    emb_dim = len(next(iter(train_id2emb.values())))
+
+    gnn = MolGNN(out_dim=emb_dim).to(device)
+    print(f"Loading GNN checkpoint: {MODEL_PATH}")
+    gnn.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    gnn.eval()
+
+    # Fine-tune
+    llm_dir = args.out_llm_dir
+    use_lora = args.use_lora and (not args.no_lora)
+
+    if args.do_finetune:
+        print("Building RL dataset from TRAIN split (leave-one-out KNN)...")
+        rl_ds = build_knn_prompt_dataset(
+            gnn_model=gnn,
+            train_graphs=TRAIN_GRAPHS,
+            train_emb_csv=TRAIN_EMB_CSV,
+            device=device,
+            k=args.k,
+            encode_batch_size=args.encode_batch_size,
+            max_samples=args.max_train_samples,
+            leave_one_out=True,
+        )
+        print(f"RL dataset size: {len(rl_ds)}")
+
+        llm_dir = finetune_base_model(
+            base_model_name_or_path=args.base_llm,
+            output_dir=str((base_path / args.out_llm_dir)),
+            train_dataset=rl_ds,
+            device=device,
+            use_lora=use_lora,
+            num_train_steps=args.steps,
+            learning_rate=args.lr,
+            per_device_train_batch_size=args.per_device_bs,
+            gradient_accumulation_steps=args.grad_accum,
+            num_generations=args.num_generations,
+            bert_reward_batch_size=args.bert_reward_bs,
+            bf16=False,
+            fp16=torch.cuda.is_available(),
+        )
+        print(f"Saved fine-tuned model to: {llm_dir}")
+
+    # Generate
+    if args.do_generate:
+        if args.split in ("validation", "val"):
+            query_graphs = VAL_GRAPHS
+            out_csv = str(base_path / f"val_knn_gen_k{args.k}.csv")
+            eval_flag = True
+        else:
+            query_graphs = TEST_GRAPHS
+            out_csv = str(base_path / f"test_knn_gen_k{args.k}.csv")
+            eval_flag = False
+
+        if not os.path.exists(query_graphs):
+            raise FileNotFoundError(f"Missing split graphs: {query_graphs}")
+
+        llm_path = llm_dir
+        if not os.path.isabs(llm_path):
+            candidate = base_path / llm_path
+            if candidate.exists():
+                llm_path = str(candidate)
+
+        print(f"Generating with model: {llm_path}")
+        generate_desc(
+            gnn_model=gnn,
+            llm_dir_or_name=llm_path,
+            train_graphs=TRAIN_GRAPHS,
+            query_graphs=query_graphs,
+            train_emb_csv=TRAIN_EMB_CSV,
+            device=device,
+            k=args.k,
+            out_csv=out_csv,
+            encode_batch_size=args.encode_batch_size,
+            gen_batch_size=args.gen_batch_size,
+            max_new_tokens=args.max_new_tokens,
+            evaluate=eval_flag,  # <-- ADD
+        )
+
+    if (not args.do_finetune) and (not args.do_generate):
+        print("Nothing to do. Use --do_finetune and/or --do_generate.")
+
+
+if __name__ == "__main__":
+    main()

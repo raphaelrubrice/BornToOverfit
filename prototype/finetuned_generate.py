@@ -124,6 +124,7 @@ if __name__ == "__main__":
             "ID": ids,
             "embedding": [",".join(map(str, emb.tolist())) for emb in embeddings]
         })
+        os.makedirs(str(save_path), exist_ok=True)
         output_path = str(save_path / f"{split}_embeddings.csv")
         result.to_csv(output_path, index=False)
         print(f"Saved to {output_path}")

@@ -164,7 +164,6 @@ def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, 
         output_csv: Path to save retrieved descriptions
     """
     train_id2desc = load_descriptions_from_graphs(train_data)
-    test_id2desc = load_descriptions_from_graphs(test_data)
     
     train_ids = list(train_emb_dict.keys())
     train_embs = torch.stack([train_emb_dict[id_] for id_ in train_ids]).to(device)
@@ -215,6 +214,8 @@ def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, 
     print(f"Saved {len(results)} retrieved descriptions to: {output_csv}")
     
     if evaluate:
+        test_id2desc = load_descriptions_from_graphs(test_data)
+        
         metrics_path = str(Path(output_csv).with_suffix(".metrics.json"))
         evaluate_retrieval_text_metrics(
             results_df=results_df,
@@ -262,7 +263,7 @@ def main(folder, evaluate=True):
         test_data=VAL_GRAPHS,
         train_emb_dict=train_emb,
         device=DEVICE,
-        output_csv=output_val_csv
+        output_csv=output_val_csv,
         evaluate=True
     )
 
@@ -272,7 +273,7 @@ def main(folder, evaluate=True):
         test_data=TEST_GRAPHS,
         train_emb_dict=train_emb,
         device=DEVICE,
-        output_csv=output_test_csv
+        output_csv=output_test_csv,
         evaluate=False # cannot evaluate on Test data
     )
     
