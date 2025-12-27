@@ -1,15 +1,16 @@
-# submit.py
+# submit.py (UPDATED: use cross-encoder reranker)
 import os, json
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
+from torch_geometric.data import Batch as PygBatch
 
 from data_utils import GraphOnlyDataset, collate_graph_only, atom_vocab_sizes, bond_vocab_sizes
 from clip_model import CLIPGraphText
 from editor_model import GraphCaptionEditor
+from reranker_model import GraphTextReranker
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -18,29 +19,27 @@ CANDS_TEST = "candidates/test_top20.json"
 
 CLIP_CKPT = "clip_ckpt/clip.pt"
 EDITOR_CKPT = "editor_ckpt/editor.pt"
+RERANK_CKPT = "reranker_ckpt/reranker.pt"
 
 OUTCSV = "submission.csv"
 
-TOPM = 5   # on génère 5 candidats puis rerank
+TOPM = 10  # generate TOPM variants then rerank
 
 PROMPT_TEMPLATE = "Candidate: {cand}\nRewrite to match molecule:\n"
-
 TEXT_MAXLEN = 192
 GEN_MAX_NEW = 96
 
 def main():
-    # load candidates
     with open(CANDS_TEST, "r", encoding="utf-8") as f:
         cands = json.load(f)
 
-    # load CLIP
+    # Load CLIP for retrieval pipeline (already done)
     ck = torch.load(CLIP_CKPT, map_location="cpu")
     clip = CLIPGraphText(atom_vocab_sizes(), bond_vocab_sizes(), graph_dim=ck["graph_dim"], text_model=ck["text_model"]).to(DEVICE)
     clip.load_state_dict(ck["state"], strict=True)
     clip.eval()
-    tok_clip = AutoTokenizer.from_pretrained(ck["text_model"])
 
-    # load Editor
+    # Load Editor
     ed_ck = torch.load(EDITOR_CKPT, map_location="cpu")
     tok_gpt = AutoTokenizer.from_pretrained(ed_ck["gpt2"])
     if tok_gpt.pad_token is None:
@@ -49,6 +48,21 @@ def main():
     editor.load_state_dict(ed_ck["state"], strict=True)
     editor.eval()
 
+    # Load Cross-encoder reranker
+    rr_ck = torch.load(RERANK_CKPT, map_location="cpu")
+    rr_tok = AutoTokenizer.from_pretrained(rr_ck["bert_name"])
+    reranker = GraphTextReranker(
+        atom_vocab=atom_vocab_sizes(),
+        bond_vocab=bond_vocab_sizes(),
+        bert_name=rr_ck["bert_name"],
+        graph_dim=256,
+        graph_layers=4,
+        max_graph_tokens=rr_ck["max_graph_tokens"],
+        dropout=0.1,
+    ).to(DEVICE)
+    reranker.load_state_dict(rr_ck["state"], strict=True)
+    reranker.eval()
+
     ds = GraphOnlyDataset(TEST)
     dl = DataLoader(ds, batch_size=16, shuffle=False, collate_fn=collate_graph_only)
 
@@ -56,23 +70,17 @@ def main():
     for bg, ids in tqdm(dl, desc="Submit"):
         bg = bg.to(DEVICE)
 
-        # graph embedding for rerank
-        with torch.no_grad():
-            zg = clip.g(bg)  # (B, d)
-
         best_texts = []
         for b, gid in enumerate(ids):
             cand_list = cands[gid][:TOPM]
             prompts = [PROMPT_TEMPLATE.format(cand=c["desc"]) for c in cand_list]
+
             enc = tok_gpt(prompts, padding=True, truncation=True, max_length=TEXT_MAXLEN, return_tensors="pt")
             in_ids = enc["input_ids"].to(DEVICE)
             attn = enc["attention_mask"].to(DEVICE)
 
-            # generate M outputs for this single graph -> we duplicate the graph B times
+            # build batch of same graph repeated TOPM times
             subgraph = bg.get_example(b)
-            sub_batch = subgraph
-            # build a batch of size TOPM
-            from torch_geometric.data import Batch as PygBatch
             sub_batch = PygBatch.from_data_list([subgraph for _ in range(len(prompts))]).to(DEVICE)
 
             gen_ids = editor.generate(
@@ -80,16 +88,14 @@ def main():
                 max_new_tokens=GEN_MAX_NEW, num_beams=4, length_penalty=1.0, no_repeat_ngram_size=3
             )
             gen_texts = tok_gpt.batch_decode(gen_ids, skip_special_tokens=True)
-            # remove prompt prefix if it leaks into output (optional cleanup)
             gen_texts = [t.split("Rewrite to match molecule:")[-1].strip() for t in gen_texts]
 
-            # rerank using CLIP text encoder similarity to the original graph embedding
-            enc2 = tok_clip(gen_texts, padding=True, truncation=True, max_length=128, return_tensors="pt")
+            # rerank with cross-encoder: score(graph, text)
+            rr_enc = rr_tok(gen_texts, padding=True, truncation=True, max_length=128, return_tensors="pt")
             with torch.no_grad():
-                zt = clip.t(enc2["input_ids"].to(DEVICE), enc2["attention_mask"].to(DEVICE))  # (M, d)
+                logits = reranker(sub_batch, rr_enc["input_ids"].to(DEVICE), rr_enc["attention_mask"].to(DEVICE))
+                best = gen_texts[int(torch.argmax(logits).item())]
 
-            scores = (F.normalize(zg[b:b+1], dim=-1) @ F.normalize(zt, dim=-1).t()).squeeze(0)  # (M,)
-            best = gen_texts[int(scores.argmax().item())]
             best_texts.append(best)
 
         for gid, txt in zip(ids, best_texts):
