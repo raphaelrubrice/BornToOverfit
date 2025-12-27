@@ -24,12 +24,21 @@ if __name__ == "__main__":
                     default=16,
                     help="Batch size for embedding generation (default: 16)"
                 )
-    args = parser.parse_args()
+    parser.add_argument("-f_data", default="data_baseline/data", type=str)
+    parser.add_argument("-f", default="data_baseline/data", type=str)
 
+    args = parser.parse_args()
+    data_folder = args.f_data
+    folder = args.f
+
+    # =========================================================
+    # CONFIG
+    # =========================================================
     file_path = Path(os.path.abspath(__file__))
     parent_folder = file_path.parent
 
-    base_path = parent_folder / "data"
+    data_path = parent_folder.parent / data_folder
+    base_path = parent_folder.parent / folder
 
     # Configuration
     MAX_TOKEN_LENGTH = 128
@@ -54,7 +63,7 @@ if __name__ == "__main__":
         print(f"\nProcessing {split}...")
         
         # Load graphs from pkl file
-        pkl_path = str(base_path / f'{split}_graphs.pkl')
+        pkl_path = str(data_path / f'{split}_graphs.pkl')
         print(f"Loading from {pkl_path}...")
         with open(pkl_path, 'rb') as f:
             graphs = pickle.load(f)

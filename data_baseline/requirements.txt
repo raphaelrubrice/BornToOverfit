@@ -9,3 +9,6 @@ peft
 bitsandbytes
 sacrebleu
 bert-score
+datasets 
+accelerate 
+trl
