@@ -202,9 +202,9 @@ def load_molgnn_gps_from_checkpoint(
     with open(config_path, "r") as f:
         cfg = json.load(f)
 
-    model_class = cfg.get("model_class", "MolGNN")
+    model_class = cfg.get("model_class", "MolGNN_GPS")
 
-    if model_class != "MolGNN":
+    if model_class != "MolGNN_GPS":
         raise ValueError(f"Unsupported GNN class: {model_class}")
 
     gnn = MolGNN_GPS(
