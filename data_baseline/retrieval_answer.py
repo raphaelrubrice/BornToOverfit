@@ -14,24 +14,32 @@ from model_captioning import Graph2TextModel
 # PATHS
 # =========================================================
 TEST_GRAPHS = "data/test_graphs.pkl"
-CKPT_PATH = "checkpoints/graph2text_gpt2.pt"
-OUTPUT_CSV = "test_generated_descriptions.csv"
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+MODEL_DIR = os.environ.get("CHECKPOINT_DIR", "checkpoints")
+BEST_CKPT_PATH = os.path.join(MODEL_DIR, "graph2text_gpt2_best.pt")
+
+OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "test_generated_descriptions.csv")
 
 
 def main():
-    if not os.path.exists(CKPT_PATH):
-        raise FileNotFoundError(f"Checkpoint not found: {CKPT_PATH}. Train first: python train_gcn.py")
+    print(f"Device: {DEVICE}")
+    print(f"Checkpoint dir: {MODEL_DIR}")
+
+    if not os.path.exists(BEST_CKPT_PATH):
+        raise FileNotFoundError(f"BEST checkpoint not found: {BEST_CKPT_PATH}. Train first.")
 
     if not os.path.exists(TEST_GRAPHS):
         raise FileNotFoundError(f"Test graphs not found: {TEST_GRAPHS}")
 
-    ckpt = torch.load(CKPT_PATH, map_location="cpu")
-    tokenizer = AutoTokenizer.from_pretrained(ckpt["tokenizer_name"])
+    ckpt = torch.load(BEST_CKPT_PATH, map_location="cpu")
+    tokenizer_name = ckpt.get("tokenizer_name", "gpt2")
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Vocab sizes for graph feature embeddings
     atom_vocab_sizes = [
         len(x_map["atomic_num"]),
         len(x_map["chirality"]),
@@ -54,7 +62,7 @@ def main():
         bond_vocab_sizes=bond_vocab_sizes,
         d_model=768,
         gnn_layers=4,
-        gpt2_name=ckpt["tokenizer_name"],
+        gpt2_name=tokenizer_name,
         dropout=0.1,
     ).to(DEVICE)
 
@@ -67,6 +75,7 @@ def main():
     results = []
     for batch_graph, ids in tqdm(test_dl, desc="Generating"):
         batch_graph = batch_graph.to(DEVICE)
+
         gen_ids = model.generate(
             batch_graph,
             tokenizer,
@@ -82,7 +91,7 @@ def main():
 
     df = pd.DataFrame(results)
     df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\n✅ Saved submission-like file to {OUTPUT_CSV} ({len(df)} rows)")
+    print(f"\n✅ Saved: {OUTPUT_CSV} ({len(df)} rows)")
     print(df.head())
 
 
