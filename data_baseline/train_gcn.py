@@ -178,6 +178,7 @@ def train_epoch(mol_enc, loader, optimizer, device):
 
 @torch.no_grad()
 def eval_retrieval(data_path, emb_dict, mol_enc, device, dl=None):
+    mol_enc.eval()
     if dl is None:
         ds = PreprocessedGraphDataset(data_path, emb_dict)
         dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
@@ -270,7 +271,7 @@ def main(folder):
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
     val_ds = PreprocessedGraphDataset(VAL_GRAPHS, val_emb)
-    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
     mol_enc = MolGNN(out_dim=emb_dim, hidden=HIDDEN, layers=LAYERS, x_map=x_map, e_map=e_map).to(DEVICE)
 

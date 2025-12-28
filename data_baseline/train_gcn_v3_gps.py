@@ -159,27 +159,39 @@ def train_epoch(mol_enc, loader, optimizer, device):
 
 
 @torch.no_grad()
-def eval_retrieval(data_path, emb_dict, mol_enc, device):
+def eval_retrieval(data_path, emb_dict, mol_enc, device, dl=None):
     mol_enc.eval()
-    ds = PreprocessedGraphDataset(data_path, emb_dict)
-    dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
+    if dl is None:
+        ds = PreprocessedGraphDataset(data_path, emb_dict)
+        dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
+
     all_mol, all_txt = [], []
     for graphs, text_emb in dl:
-        graphs, text_emb = graphs.to(device), text_emb.to(device)
+        graphs = graphs.to(device)
+        text_emb = text_emb.to(device)
         all_mol.append(mol_enc(graphs))
         all_txt.append(F.normalize(text_emb, dim=-1))
-    all_mol, all_txt = torch.cat(all_mol), torch.cat(all_txt)
-    
+    all_mol = torch.cat(all_mol, dim=0)
+    all_txt = torch.cat(all_txt, dim=0)
+
     sims = all_txt @ all_mol.t()
     ranks = sims.argsort(dim=-1, descending=True)
+
     N = all_txt.size(0)
-    correct = torch.arange(N, device=sims.device)
+    device = sims.device
+    correct = torch.arange(N, device=device)
+
     pos = (ranks == correct.unsqueeze(1)).nonzero()[:, 1] + 1
-    
+
     mrr = (1.0 / pos.float()).mean().item()
+
     results = {"MRR": mrr}
+
     for k in (1, 5, 10):
-        results[f"R@{k}"] = (pos <= k).float().mean().item()
+        hitk = (pos <= k).float().mean().item()
+        results[f"R@{k}"] = hitk
+        results[f"Hit@{k}"] = hitk
+
     return results
 
 def load_molgnn_gps_from_checkpoint(
@@ -250,6 +262,8 @@ def main(data_folder, output_folder):
         return
 
     # Load Embeddings
+    print("TRAIN EMB", TRAIN_EMB_CSV)
+    print("VAL EMB", VAL_EMB_CSV)
     train_emb = load_id2emb(TRAIN_EMB_CSV)
     val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
     emb_dim = len(next(iter(train_emb.values())))
@@ -259,7 +273,7 @@ def main(data_folder, output_folder):
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
     val_ds = PreprocessedGraphDataset(VAL_GRAPHS, val_emb)
-    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
     # Initialize Model
     mol_enc = MolGNN_GPS(
