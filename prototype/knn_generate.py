@@ -5,7 +5,7 @@ knn_generate.py
 kNN + LLM generation with GRPO fine-tuning (TRL).
 
 Key design choices:
-- Retrieval/prompting uses your existing GNN embedding space (MolGNN) + train text embeddings.
+- Retrieval/prompting uses existing GNN embedding space (MolGNN) + train text embeddings.
 - Base generative model: a light modern HF instruct model (<= 1B params)
 - Reward: heavy penalty if not exact match, plus informative shaping using BLEU-F1 + BERTScore(roberta-base).
 
@@ -49,6 +49,7 @@ from transformers import (
     GenerationConfig,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
     DataCollatorForSeq2Seq, 
     DataCollatorWithPadding
 )
@@ -91,6 +92,51 @@ try:
 except Exception:
     _EVAL_AVAILABLE = False
 
+# --------------------------------------------------------------------------------------
+# Helper: Dynamic Context Length Detection
+# --------------------------------------------------------------------------------------
+def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
+    """
+    Robustly determine a safe context length for the model.
+    Checks config for 'max_position_embeddings', 'n_positions', 'seq_length'.
+    Caps the value at 'cap' to prevent OOM on consumer hardware (default 4096).
+    """
+    try:
+        config = AutoConfig.from_pretrained(model_name_or_path)
+        # Check common attributes for context length
+        possible_limits = [
+            getattr(config, "max_position_embeddings", None),
+            getattr(config, "n_positions", None), # GPT-2 / older models
+            getattr(config, "seq_length", None),  # Some specialized models
+            getattr(config, "max_seq_len", None), 
+        ]
+        
+        # Filter out None and take the maximum found
+        valid_limits = [x for x in possible_limits if x is not None and isinstance(x, int)]
+        limit = max(valid_limits) if valid_limits else 1024 # Fallback to 1024 if nothing found
+        
+        # Double check tokenizer if the config gave a generic default or failed
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+            if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 1e9:
+                # Some tokenizers return huge ints for "unlimited"; ignore those
+                limit = max(limit, tokenizer.model_max_length)
+        except Exception:
+            pass
+
+        print(f" [Context Detection] Model native limit: {limit}")
+        
+        if limit > cap:
+            print(f" [Context Detection] Capping context to {cap} for memory safety.")
+            return cap
+            
+        return limit
+
+    except Exception as e:
+        print(f" [Context Detection] Warning: Could not auto-detect. Error: {e}")
+        print(" [Context Detection] Defaulting to 1024.")
+        return 1024
+    
 # --------------------------------------------------------------------------------------
 # Prompting utilities
 # --------------------------------------------------------------------------------------
@@ -194,6 +240,39 @@ def knn_topk(
     top_sims, top_idx = torch.topk(sims, k=k_eff, dim=-1, largest=True, sorted=True)
     return top_idx, top_sims
 
+def compute_similarity_thresholds(sims_tensor: torch.Tensor) -> List[float]:
+    """
+    Computes 20th, 40th, 60th, 80th percentiles of the similarity distribution.
+    Args:
+        sims_tensor: Tensor of shape [N, k] containing cosine similarities.
+    Returns:
+        List of 4 thresholds [q20, q40, q60, q80]
+    """
+    # Flatten to get global distribution of "neighbor matches"
+    flat_sims = sims_tensor.view(-1).float()
+    quantiles = torch.tensor([0.2, 0.4, 0.6, 0.8], device=flat_sims.device)
+    thresholds = torch.quantile(flat_sims, quantiles)
+    return thresholds.cpu().tolist()
+
+def get_closeness_tag(sim: float, thresholds: List[float]) -> str:
+    """
+    Maps a similarity score to a closeness tag based on thresholds.
+    Thresholds: [very_distant_upper, distant_upper, average_upper, close_upper]
+    """
+    # Thresholds are q20, q40, q60, q80.
+    # q80 means 80% of data is below this value -> Top 20% are > q80
+    q20, q40, q60, q80 = thresholds
+    
+    if sim >= q80:
+        return "[VERY_CLOSE]"
+    elif sim >= q60:
+        return "[CLOSE]"
+    elif sim >= q40:
+        return "[AVERAGE]"
+    elif sim >= q20:
+        return "[DISTANT]"
+    else:
+        return "[VERY_DISTANT]"
 
 # --------------------------------------------------------------------------------------
 # Rewards: BLEU-F1 + BERTScore(roberta-base) + exact match penalty
@@ -341,8 +420,80 @@ def make_reward_fn(
     return reward_fn
 
 
+def fit_neighbors_efficiently(
+    tokenizer,
+    query_card: str,
+    neighbor_descs: List[str],
+    neighbor_cards: List[str],
+    neighbor_tags: List[str], # <--- NEW ARGUMENT
+    max_length: int = 1024
+) -> str:
+    """
+    Includes Closeness Tags to nuance the model's reliance on neighbors.
+    """
+    
+    # --- 1. Meta-Cognitive Instructions ---
+    base_instruction = (
+        "You are an expert chemist. Generate a factual description of the Query Molecule based on its feature card.\n"
+        "You are provided with K nearest neighbors, tagged by their similarity (e.g., [VERY_CLOSE], [DISTANT]).\n\n"
+        "**Guidance on Using Neighbors:**\n"
+        "- **[VERY_CLOSE] / [CLOSE]**: Highly reliable. The neighbor likely shares the scaffold and key functional groups. You may infer chemical class from these.\n"
+        "- **[AVERAGE]**: Partially relevant. Shares some features but likely differs in others.\n"
+        "- **[DISTANT] / [VERY_DISTANT]**: Unreliable for content. Use these ONLY for formatting/style. Do not copy their chemical features.\n\n"
+        "**Strict Constraint**: The 'Query Molecule Card' is the ground truth. Never hallucinate features from neighbors that contradict the card."
+    )
+
+    # --- 2. Compact Data Templates with Tags ---
+    neighbor_template = (
+        "\n[NEIGHBOR_{i} {tag}]\n" 
+        "Card: {card}\n"
+        "Description: {desc}"
+    )
+    
+    footer = (
+        "\n\n[QUERY MOLECULE]\n"
+        f"Card: {query_card.strip() if query_card else 'UNKNOWN'}\n"
+        "Description:" 
+    )
+
+    # --- 3. Assembly (Same budget logic as before) ---
+    base_prompt_structure = f"{base_instruction}\n[CONTEXT]\n[/CONTEXT]{footer}"
+    static_tokens = len(tokenizer.encode(base_prompt_structure, add_special_tokens=False))
+    remaining_budget = max_length - static_tokens - 20
+
+    valid_neighbors_text = []
+    
+    if remaining_budget > 0:
+        # Zip tags along with cards and descs
+        for i, (c, d, tag) in enumerate(zip(neighbor_cards, neighbor_descs, neighbor_tags), start=1):
+            n_text = neighbor_template.format(
+                i=i, 
+                tag=tag,
+                card=c.strip() if c else "UNKNOWN", 
+                desc=(d or "").strip()
+            )
+            
+            n_len = len(tokenizer.encode(n_text, add_special_tokens=False))
+            
+            if n_len <= remaining_budget:
+                valid_neighbors_text.append(n_text)
+                remaining_budget -= n_len
+            else:
+                break
+    
+    if valid_neighbors_text:
+        return (
+            f"{base_instruction}\n"
+            f"[CONTEXT]"
+            f"{''.join(valid_neighbors_text)}"
+            f"\n[/CONTEXT]"
+            f"{footer}"
+        )
+    else:
+        return f"{base_instruction}{footer}"
+
 # --------------------------------------------------------------------------------------
-# Build RL dataset: prompts from KNN, references from ground truth
+# Build KNN dataset: prompts from KNN, references from ground truth
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def build_knn_prompt_dataset(
@@ -352,17 +503,20 @@ def build_knn_prompt_dataset(
     device: str,
     k: int,
     encode_batch_size: int,
+    tokenizer_or_path: str,
+    max_prompt_length: int = 1024,
     max_samples: Optional[int] = None,
     leave_one_out: bool = True,
 ) -> Dataset:
-    """
-    Dataset columns:
-      - prompt:    chat-style messages (list[{"role","content"}])
-      - reference: ground-truth description (string)
-
-    Uses TRAIN split for RL prompts with leave-one-out KNN retrieval.
-    Incorporates mol_card (query + neighbors) in prompts.
-    """
+    
+    # --- Setup Tokenizer for Smart Truncation ---
+    if isinstance(tokenizer_or_path, str):
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_path, 
+                                                    use_fast=True, 
+                                                    trust_remote_code=True)
+    else:
+        tokenizer = tokenizer_or_path
+        
     # Load train text embeddings (targets of GNN)
     train_id2emb = load_id2emb(train_emb_csv)
     train_ids = list(train_id2emb.keys())
@@ -391,13 +545,21 @@ def build_knn_prompt_dataset(
             if j is not None:
                 mask_self[i, j] = True
 
-    top_idx, _top_sims = knn_topk(
+    top_idx, top_sims = knn_topk(
         query_embs_norm=train_gnn_embs,
         train_embs_norm=train_embs,
         k=k,
         mask_self=mask_self,
     )
+    
+    # --- Compute Dynamic Thresholds ---
+    print("Computing closeness thresholds from training distribution...")
+    thresholds = compute_similarity_thresholds(top_sims)
+    print(f"Thresholds (20%, 40%, 60%, 80%): {thresholds}")
+    
     top_idx = top_idx.cpu().tolist()
+    # Keep sims on CPU for fast iteration
+    top_sims_list = top_sims.cpu().tolist()
 
     prompts: List[List[Dict[str, str]]] = []
     references: List[str] = []
@@ -406,18 +568,41 @@ def build_knn_prompt_dataset(
     if max_samples is not None:
         n = min(n, int(max_samples))
 
-    for i in range(n):
+    for i in tqdm(range(n), desc="Building KNN Dataset"):
         qid = train_ids_ordered[i]
-
+        
+        # Get neighbor data
         neighbor_ids = [train_ids[j] for j in top_idx[i]]
         neighbor_descs = [train_id2desc.get(nid, "") for nid in neighbor_ids]
         neighbor_cards = [train_id2card.get(nid, "") for nid in neighbor_ids]
+        
+        # --- Get Tags ---
+        current_sims = top_sims_list[i]
+        neighbor_tags = [get_closeness_tag(s, thresholds) for s in current_sims]
 
         query_card = train_id2card.get(qid, "")
 
-        ptxt = build_prompt(query_card, neighbor_descs, neighbor_cards)
-        prompts.append(prompt_as_chat(ptxt))
+        smart_prompt_text = fit_neighbors_efficiently(
+            tokenizer=tokenizer,
+            query_card=query_card,
+            neighbor_descs=neighbor_descs,
+            neighbor_cards=neighbor_cards,
+            neighbor_tags=neighbor_tags,
+            max_length=max_prompt_length
+        )
+
+        # Wrap back into chat format for compatibility
+        prompts.append(prompt_as_chat(smart_prompt_text))
         references.append(train_id2desc.get(qid, ""))
+
+        if i == 0:
+            print(f"\n[DEBUG] Dataset Build - Sample 0 Prompt (Length: {len(tokenizer.encode(smart_prompt_text))} tokens)")
+            print("="*60)
+            print(smart_prompt_text)
+            print("="*60)
+            print(f"[DEBUG] Dataset Build - Sample 0 Reference")
+            print(train_id2desc.get(qid, ""))
+            print("="*60 + "\n")
 
     return Dataset.from_dict({"prompt": prompts, "reference": references})
 
@@ -450,7 +635,7 @@ def _render_prompt_for_sft(tokenizer, prompt_messages: List[Dict[str, str]]) -> 
 def sft_finetune_on_knn(
     base_model_name_or_path: str,
     output_dir: str,
-    train_dataset: Dataset,  # expects columns: "prompt" (chat messages), "reference" (string)
+    train_dataset: Dataset,
     device: str,
     use_lora: bool = True,
     lora_r: int = 16,
@@ -469,17 +654,26 @@ def sft_finetune_on_knn(
     """
     Supervised fine-tuning (SFT) stage on the KNN prompt dataset.
     Produces an intermediate model directory to be used as the starting policy for RL.
-
-    Works for:
-      - decoder-only (CausalLM) models
-      - encoder-decoder (Seq2SeqLM) models
     """
     os.makedirs(output_dir, exist_ok=True)
 
     config = AutoConfig.from_pretrained(base_model_name_or_path)
-    torch_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
+    
+    # --- Robust dtype selection ---
+    if bf16:
+        torch_dtype = torch.bfloat16
+    elif fp16:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            print("Upgrading float16 -> bfloat16 for stability.")
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = torch.float16
+    else:
+        torch_dtype = torch.float32
+
     device_map = "auto" if torch.cuda.is_available() else None
 
+    # Load Model
     if config.is_encoder_decoder:
         model = AutoModelForSeq2SeqLM.from_pretrained(
             base_model_name_or_path,
@@ -493,9 +687,16 @@ def sft_finetune_on_knn(
             device_map=device_map,
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True)
+    # Enable Gradient Checkpointing manually to be safe
+    # This drastically reduces VRAM usage by not storing intermediate activations
+    model.gradient_checkpointing_enable()
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, 
+                                              use_fast=True,
+                                              trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    
     tokenizer.padding_side = "right" if config.is_encoder_decoder else "left"
 
     if use_lora:
@@ -508,68 +709,106 @@ def sft_finetune_on_knn(
             target_modules="all-linear",
         )
         model = get_peft_model(model, lora_cfg)
+        # Gradient checkpointing and LoRA compatibility fix
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
         model.print_trainable_parameters()
 
     # ----------------------------
-    # Tokenization: build training examples
+    # Tokenization
     # ----------------------------
     def _tokenize_row(ex):
         prompt_msgs = ex["prompt"]
         ref = ex["reference"] or ""
 
         if config.is_encoder_decoder:
-            # Seq2Seq: encode prompt as input, reference as target
+            # 1. Tokenize Input (Encoder)
+            # T5 inputs do NOT need an EOS at the end, just padding.
             prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
             model_inputs = tokenizer(
                 prompt_text,
                 max_length=max_prompt_length,
                 truncation=True,
             )
+
+            # 2. Tokenize Output (Decoder Labels)
+            # We use 'text_target' which typically adds EOS automatically.
+            # However, we can perform a safety check to ensure it's there.
             labels = tokenizer(
-                                text_target=ref,
-                                max_length=max_completion_length,
-                                truncation=True,
-                            )["input_ids"]
+                text_target=ref, 
+                max_length=max_completion_length,
+                truncation=True,
+            )["input_ids"]
+
+            # --- SAFETY CHECK FOR T5 ---
+            # Ensure the last token is indeed the EOS token.
+            # T5 uses </s> (id=1) as EOS.
+            if len(labels) > 0 and labels[-1] != tokenizer.eos_token_id:
+                # If truncation cut it off, or tokenizer didn't add it:
+                if len(labels) >= max_completion_length:
+                    # Make room for EOS if we are at max length
+                    labels[-1] = tokenizer.eos_token_id 
+                else:
+                    # Append EOS if missing
+                    labels.append(tokenizer.eos_token_id)
+            
             model_inputs["labels"] = labels
             return model_inputs
 
-        # CausalLM: encode (prompt + reference) and mask prompt tokens from loss
+        # CausalLM
         prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
-        full_text = prompt_text + " " + ref
+        
+        # 1. Construct Full Text
+        # We append tokenizer.eos_token to ensure the model learns to STOP.
+        full_text = prompt_text + " " + ref + tokenizer.eos_token
 
-        prompt_ids = tokenizer(
-            prompt_text,
-            max_length=max_prompt_length,
-            truncation=True,
-            add_special_tokens=False,
-        )["input_ids"]
-
+        # 2. Tokenize the full text with special tokens (BOS is usually added here)
         full = tokenizer(
             full_text,
             max_length=max_prompt_length + max_completion_length,
             truncation=True,
-            add_special_tokens=True,
+            add_special_tokens=True, 
         )
+        
+        input_ids = full["input_ids"]
+        labels = input_ids.copy()
 
-        labels = full["input_ids"].copy()
-        # mask the prompt portion
-        cut = min(len(prompt_ids), len(labels))
-        for i in range(cut):
+        # 3. Mask the Prompt so we don't train on it
+        # We need to find the length of the prompt tokens to mask them.
+        prompt_ids = tokenizer(
+            prompt_text,
+            max_length=max_prompt_length,
+            truncation=True,
+            add_special_tokens=False, # Important: Don't add BOS here or length calc will be off
+        )["input_ids"]
+
+        # Calculate exact length of prompt in the full encoding
+        # (This can be tricky if BOS is added to full but not prompt_ids, 
+        #  so usually we just iterate to find the overlap or len)
+        prompt_len = len(prompt_ids) 
+        
+        # Safety adjustment: sometimes tokenizer merges tokens at boundaries.
+        # A simpler way often used in TRL is simply:
+        if tokenizer.bos_token_id and input_ids[0] == tokenizer.bos_token_id:
+            # If full input has BOS, prompt_ids likely didn't count it.
+             prompt_len += 1
+
+        # Apply the mask (-100)
+        for i in range(min(prompt_len, len(labels))):
             labels[i] = -100
 
         full["labels"] = labels
         return full
 
     tokenized = train_dataset.map(
-                                _tokenize_row,
-                                remove_columns=train_dataset.column_names,  # IMPORTANT: drop prompt/reference entirely
-                            )
+        _tokenize_row,
+        remove_columns=train_dataset.column_names,
+    )
 
     # ----------------------------
-    # Collator (pad inputs + labels)
+    # Collator
     # ----------------------------
     if config.is_encoder_decoder:
-        # Correctly pads labels and sets label_pad_token_id to -100.
         data_collator = DataCollatorForSeq2Seq(
             tokenizer=tokenizer,
             model=model,
@@ -577,25 +816,30 @@ def sft_finetune_on_knn(
             label_pad_token_id=-100,
         )
     else:
-        # Decoder-only: pads input_ids/attention_mask. Labels already contain -100 for prompt tokens,
-        # but they still need padding to the batch max length; pad with -100 to avoid loss on pads.
-        data_collator = DataCollatorWithPadding(
+        base_collator = DataCollatorWithPadding(
             tokenizer=tokenizer,
             padding=True,
             return_tensors="pt",
         )
 
-        # Wrap to also pad labels consistently with -100
         def _causal_collate(features):
-            batch = data_collator(features)
+            first = features[0]
+            labels = None
+            if "labels" in first:
+                labels = [f.pop("labels") for f in features]
+            
+            batch = base_collator(features)
 
-            if "labels" in batch:
-                # DataCollatorWithPadding will NOT pad labels; do it here.
-                labels = [f["labels"] for f in features]
-                max_len = max(len(l) for l in labels)
-                padded = [l + [-100] * (max_len - len(l)) for l in labels]
-                batch["labels"] = torch.tensor(padded, dtype=torch.long)
-
+            if labels is not None:
+                batch_len = batch["input_ids"].shape[1]
+                padded_labels = []
+                for l in labels:
+                    pad_len = batch_len - len(l)
+                    if tokenizer.padding_side == "left":
+                        padded_labels.append([-100] * pad_len + l)
+                    else:
+                        padded_labels.append(l + [-100] * pad_len)
+                batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
             return batch
 
         data_collator = _causal_collate
@@ -609,7 +853,7 @@ def sft_finetune_on_knn(
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
-        logging_steps=20,
+        logging_steps=10,
         save_steps=200,
         save_total_limit=2,
         bf16=bf16,
@@ -617,6 +861,94 @@ def sft_finetune_on_knn(
         report_to=[],
         seed=seed,
         remove_unused_columns=False,
+        # --- MEMORY OPTIMIZATION ---
+        gradient_checkpointing=True, # <--- CRITICAL FIX
+        gradient_checkpointing_kwargs={"use_reentrant": False}, # Safer for LoRA
+    )
+    
+    class DebugGenCallback(TrainerCallback):
+        def __init__(self, tokenizer, dataset, device, is_encoder_decoder):
+            self.tokenizer = tokenizer
+            self.sample = dataset[0]
+            self.device = device
+            self.is_encoder_decoder = is_encoder_decoder
+            
+        def on_log(self, args, state, control, model=None, **kwargs):
+            was_training = model.training
+            model.eval()
+            
+            # --- FIX STARTS HERE ---
+            # 1. Get the full sequence
+            full_input_ids = torch.tensor([self.sample["input_ids"]]).to(self.device)
+            
+            # 2. Determine where the prompt ends
+            if self.is_encoder_decoder:
+                # For T5/Seq2Seq, input_ids is just the prompt. No slicing needed.
+                input_ids = full_input_ids
+            else:
+                # For Decoder-only (Qwen, Llama), input_ids is Prompt + Answer.
+                # We use the labels (masked with -100) to find the split point.
+                labels = torch.tensor([self.sample["labels"]]).to(self.device)
+                
+                # Find the last index where label is -100 (which indicates prompt tokens)
+                # We want to slice input_ids up to that point.
+                # Note: labels are -100 for the prompt, and valid IDs for the answer.
+                mask = (labels == -100)
+                
+                # If there are no -100s, it might be all answer (unlikely) or no masking.
+                if mask.any():
+                    # Get the length of the prompt (number of -100s)
+                    prompt_len = mask.sum().item()
+                    input_ids = full_input_ids[:, :prompt_len]
+                else:
+                    # Fallback
+                    input_ids = full_input_ids
+
+            attention_mask = torch.ones_like(input_ids)
+            # --- FIX ENDS HERE ---
+
+            # Generate
+            with torch.no_grad():
+                gen_out = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=192,
+                    do_sample=True, 
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True
+                )
+            
+            # --- CONDITIONAL SLICING ---
+            if self.is_encoder_decoder:
+                generated_tokens = gen_out
+            else:
+                # CausalLM returns Input + New Tokens -> slice off input
+                input_len = input_ids.shape[1]
+                generated_tokens = gen_out[:, input_len:]
+            
+            gen_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+            
+            # Decode Reference (filter out -100)
+            ref_ids = [t for t in self.sample.get("labels", []) if t != -100]
+            ref_text = self.tokenizer.decode(ref_ids, skip_special_tokens=True)
+            
+            print(f"\n[Step {state.global_step} DEBUG]")
+            print(f"  Ref: {ref_text}")
+            print(f"  Gen: {gen_text}")
+            print("-" * 30)
+            
+            if was_training:
+                model.train()
+                # Re-enable GC
+                if hasattr(model, "gradient_checkpointing_enable"):
+                    model.gradient_checkpointing_enable()
+
+    debug_callback = DebugGenCallback(
+        tokenizer, 
+        tokenized, 
+        model.device, 
+        is_encoder_decoder=config.is_encoder_decoder
     )
 
     trainer = Trainer(
@@ -625,15 +957,14 @@ def sft_finetune_on_knn(
         train_dataset=tokenized,
         data_collator=data_collator,
         tokenizer=tokenizer,
+        callbacks=[debug_callback]
     )
     trainer.train()
     
-    # If LoRA was used, merge adapter into the base model and save a full model
     if use_lora:
-        # PeftModel supports merge_and_unload()
         model = model.merge_and_unload()
 
-    model.save_pretrained(output_dir)      # saves config.json + model weights
+    model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     return output_dir
 
@@ -676,14 +1007,26 @@ def finetune_base_model(
     if rl_algo not in {"grpo", "ppo"}:
         raise ValueError(f"Unsupported rl_algo={rl_algo}. Expected 'grpo' or 'ppo'.")
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, 
+                                                use_fast=True,
+                                                trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
     config = AutoConfig.from_pretrained(base_model_name_or_path)
 
-    torch_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
+    if bf16:
+        torch_dtype = torch.bfloat16
+    elif fp16:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            print("Upgrading float16 -> bfloat16 for stability.")
+            torch_dtype = torch.bfloat16
+        else:
+            torch_dtype = torch.float16
+    else:
+        torch_dtype = torch.float32
+        
     device_map = "auto" if torch.cuda.is_available() else None
 
     # ----------------------------
@@ -933,25 +1276,71 @@ def generate_desc(
     do_sample: bool = True,
     evaluate: bool = False,
     ) -> pd.DataFrame:
-    # Load train pool (descriptions + embeddings + mol_cards)
+    
+    # ----------------------------
+    # 1. Load Tokenizer & LLM FIRST (Needed for smart prompting)
+    # ----------------------------
+    print(f"Loading LLM and Tokenizer from {llm_dir_or_name}...")
+
+    # --- DYNAMIC CONTEXT LENGTH ---
+    model_max_length = get_safe_context_length(llm_dir_or_name, cap=4096)
+    print(f"Using max prompt length: {model_max_length}")
+
+    tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    config = AutoConfig.from_pretrained(llm_dir_or_name)
+    is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
+    tokenizer.padding_side = "right" if is_seq2seq else "left"
+
+    # Determine Model Max Length
+    model_max_length = getattr(config, "max_position_embeddings", 1024)
+    if model_max_length > 4096: 
+        model_max_length = 2048 
+    
+    # --- bfloat16 for Stability ---
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        torch_dtype = torch.bfloat16
+        print("Using bfloat16.")
+    elif torch.cuda.is_available():
+        torch_dtype = torch.float16
+        print("Using float16 (Warning: Potential T5 instability).")
+    else:
+        torch_dtype = torch.float32
+
+    device_map = "auto" if torch.cuda.is_available() else None
+
+    if is_seq2seq:
+        llm = AutoModelForSeq2SeqLM.from_pretrained(llm_dir_or_name, torch_dtype=torch_dtype, device_map=device_map)
+    else:
+        llm = AutoModelForCausalLM.from_pretrained(llm_dir_or_name, torch_dtype=torch_dtype, device_map=device_map)
+    llm.eval()
+
+    # ----------------------------
+    # 2. Retrieval
+    # ----------------------------
     train_id2desc = load_descriptions_from_graphs(train_graphs)
     train_id2card = load_mol_cards_from_graphs(train_graphs)
+    query_id2card = load_mol_cards_from_graphs(query_graphs)
 
     train_id2emb = load_id2emb(train_emb_csv)
     train_ids = list(train_id2emb.keys())
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
 
-    # Load query mol_cards (from pickle if present; else compute fallback)
-    query_id2card = load_mol_cards_from_graphs(query_graphs)
-
-    # Encode query
     print("Encoding query..")
     query_embs, query_ids = encode_graphs(gnn_model, query_graphs, device=device, batch_size=encode_batch_size)
 
-    # Retrieve KNN
     print(f"Retrieving top {k} neighbors..")
     top_idx, top_sims = knn_topk(query_embs, train_embs, k=k)
+    
+    # --- Compute Thresholds for this split ---
+    thresholds = compute_similarity_thresholds(top_sims)
+    
+    top_idx = top_idx.cpu().tolist()
+    top_sims = top_sims.cpu().tolist()
+
     top_idx = top_idx.cpu().tolist()
     top_sims = top_sims.cpu().tolist()
 
@@ -959,71 +1348,59 @@ def generate_desc(
     nn_ids_all: List[List[str]] = []
     sims_all: List[List[float]] = []
 
-    for i in tqdm(list(range(len(query_ids))), desc="Building prompts.."):
+    for i in tqdm(list(range(len(query_ids))), desc="Building smart prompts.."):
         qid = query_ids[i]
-
         nn_ids = [train_ids[j] for j in top_idx[i]]
         nn_descs = [train_id2desc.get(nid, "") for nid in nn_ids]
         nn_cards = [train_id2card.get(nid, "") for nid in nn_ids]
-
         query_card = query_id2card.get(qid, "")
 
-        prompts_text.append(build_prompt(query_card, nn_descs, nn_cards))
+        # -- Use Smart Truncation ---
+        current_sims = top_sims[i]
+        neighbor_tags = [get_closeness_tag(s, thresholds) for s in current_sims]
+        
+        smart_prompt = fit_neighbors_efficiently(
+            tokenizer=tokenizer,
+            query_card=query_card,
+            neighbor_descs=nn_descs,
+            neighbor_cards=nn_cards,
+            neighbor_tags=neighbor_tags,
+            max_length=model_max_length
+        )
+        prompts_text.append(smart_prompt)
         nn_ids_all.append(nn_ids)
         sims_all.append([float(s) for s in top_sims[i]])
 
     # ----------------------------
-    # Load LLM (Seq2Seq or CausalLM)
+    # 3. Batch Generation
     # ----------------------------
-    tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
-
-    # Ensure pad token exists (required for batching)
-    if tokenizer.pad_token is None:
-        # Common fallback; works for most decoder-only and many encoder-decoder setups
-        tokenizer.pad_token = tokenizer.eos_token
-
-    config = AutoConfig.from_pretrained(llm_dir_or_name)
-    is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
-
-    tokenizer.padding_side = "right" if is_seq2seq else "left"
-    
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    device_map = "auto" if torch.cuda.is_available() else None
-
+    decoder_start_token_id = None
     if is_seq2seq:
-        llm = AutoModelForSeq2SeqLM.from_pretrained(
-            llm_dir_or_name,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-        )
-    else:
-        llm = AutoModelForCausalLM.from_pretrained(
-            llm_dir_or_name,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-        )
-
-    llm.eval()
+        if hasattr(llm.config, "decoder_start_token_id") and llm.config.decoder_start_token_id is not None:
+            decoder_start_token_id = llm.config.decoder_start_token_id
+        elif hasattr(tokenizer, "pad_token_id"):
+            decoder_start_token_id = tokenizer.pad_token_id
 
     gen_cfg = GenerationConfig(
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
+        do_sample=do_sample,        # random sampling 
+        num_beams=4,            # Enable Beam Search
+        repetition_penalty=1.25, # Penalize the "gibberish loops"
         temperature=temperature,
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        decoder_start_token_id=decoder_start_token_id
     )
 
-    # ----------------------------
-    # Batch generation
-    # ----------------------------
-    use_chat_template = bool(
-        hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None)
-    )
-
+    use_chat_template = bool(hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None))
     generations: List[str] = []
+
     for start in tqdm(list(range(0, len(prompts_text), gen_batch_size)), desc="Generating.."):
         batch_prompts = prompts_text[start : start + gen_batch_size]
+        
+        # Failsafe: Left truncation if somehow we still exceed limits
+        tokenizer.truncation_side = 'left' 
 
         if use_chat_template:
             batch_msgs = [prompt_as_chat(p) for p in batch_prompts]
@@ -1034,50 +1411,50 @@ def generate_desc(
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
+                max_length=model_max_length
             ).to(llm.device)
-
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
-
-            outputs = llm.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                generation_config=gen_cfg,
-            )
-
-            if is_seq2seq:
-                # Seq2Seq: decode full sequences
-                texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            else:
-                # CausalLM: strip prompt tokens
-                gen_only = outputs[:, input_ids.shape[1] :]
-                texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
-
         else:
             enc = tokenizer(
                 batch_prompts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
+                max_length=model_max_length
             ).to(llm.device)
+            input_ids = enc["input_ids"]
 
-            outputs = llm.generate(**enc, generation_config=gen_cfg)
+        # --- Explicit Attention Mask ---
+        attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
-            if is_seq2seq:
-                texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            else:
-                gen_only = outputs[:, enc["input_ids"].shape[1] :]
-                texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+        outputs = llm.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            generation_config=gen_cfg,
+        )
 
-        generations.extend([t.strip() for t in texts])
+        if is_seq2seq:
+            texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        else:
+            gen_only = outputs[:, input_ids.shape[1] :]
+            texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+        
+        batch_gens = [t.strip() for t in texts]
+        generations.extend(batch_gens)
+
+        if start == 0:
+            print("\n" + "="*60)
+            print(" [DEBUG] Sanity Check: Generation Batch 0, Item 0")
+            print("="*60)
+            print(f"--- Prompt Sent to Model (Truncated) ---\n{batch_prompts[0][-500:]}") 
+            print("-" * 30)
+            # This is the actual model output you were looking for:
+            print(f"--- ACTUAL MODEL OUTPUT ---\n{batch_gens[0]}")
+            print("="*60 + "\n")
 
     # Write CSV
     rows = []
     for i, qid in tqdm(enumerate(query_ids), desc='Creating the DataFrame..'):
-        row = {
-            "ID": qid,
-            "Prompt": prompts_text[i],
-            "generated_description": generations[i],
-        }
+        row = { "ID": qid, "Prompt": prompts_text[i], "generated_description": generations[i] }
         for j in range(len(nn_ids_all[i])):
             row[f"NN{j+1}"] = nn_ids_all[i][j]
             row[f"SIM{j+1}"] = sims_all[i][j]
@@ -1085,27 +1462,14 @@ def generate_desc(
 
     df = pd.DataFrame(rows)
     os.makedirs(str(Path(out_csv).parent), exist_ok=True)
-    print("Writing to CSV..")
     df.to_csv(out_csv, index=False)
     print(f"Saved generations to: {out_csv}")
-
-    df.to_csv(out_csv, index=False)
-    print(f"Saved generations to: {out_csv}")
-
-    # Optional evaluation (intended for validation split where references exist)
-    if evaluate:
-        if not _EVAL_AVAILABLE:
-            print("WARNING: Evaluation requested but retrieval_answer.evaluate_retrieval_text_metrics is not available.")
-        else:
-            query_id2desc = load_descriptions_from_graphs(query_graphs)
-            metrics_path = str(Path(out_csv).with_suffix(".metrics.json"))
-            eval_df = df[["ID", "generated_description"]].rename(columns={"generated_description": "description"})
-            evaluate_retrieval_text_metrics(
-                results_df=eval_df,
-                test_id2desc=query_id2desc,
-                device=device,
-                save_path=metrics_path,
-            )
+    
+    if evaluate and _EVAL_AVAILABLE:
+        query_id2desc = load_descriptions_from_graphs(query_graphs)
+        metrics_path = str(Path(out_csv).with_suffix(".metrics.json"))
+        eval_df = df[["ID", "generated_description"]].rename(columns={"generated_description": "description"})
+        evaluate_retrieval_text_metrics(results_df=eval_df, test_id2desc=query_id2desc, device=device, save_path=metrics_path)
 
     return df
 
@@ -1120,7 +1484,7 @@ def main():
     parser.add_argument("--k", default=3, type=int)
     parser.add_argument("--encode_batch_size", default=128, type=int)
     parser.add_argument("--max_train_samples", default=None, type=int, help="Limit RL dataset size for quick prototyping")
-
+    
     # LLM
     parser.add_argument(
         "--base_llm",
@@ -1128,6 +1492,7 @@ def main():
         type=str,
         help="HF model name/path (<=1B recommended).",
     )
+    parser.add_argument("--max_prompt_length", default=None, type=int, help="Override auto-detected context length")
     parser.add_argument("--out_llm_dir", default="knn_llm", type=str, help="Where to save the fine-tuned model")
 
     # Actions
@@ -1185,6 +1550,15 @@ def main():
         if not os.path.exists(p):
             raise FileNotFoundError(f"Missing required file: {p}")
 
+    # --- DYNAMIC CONTEXT LENGTH DETECTION ---
+    if args.max_prompt_length is not None:
+        context_len = args.max_prompt_length
+        print(f"Using user-overridden context length: {context_len}")
+    else:
+        # Detect from the base model (or the fine-tuned one if provided)
+        # We use args.base_llm for detection as it's the architecture source
+        context_len = get_safe_context_length(args.base_llm, cap=4096)
+
     # Load GNN
     train_id2emb = load_id2emb(TRAIN_EMB_CSV)
     emb_dim = len(next(iter(train_id2emb.values())))
@@ -1204,6 +1578,8 @@ def main():
 
     if args.do_finetune:
         print("Building KNN dataset from TRAIN split (leave-one-out KNN)...")
+        
+        # --- Pass tokenizer to dataset builder ---
         knn_ds = build_knn_prompt_dataset(
             gnn_model=gnn,
             train_graphs=TRAIN_GRAPHS,
@@ -1211,6 +1587,8 @@ def main():
             device=device,
             k=args.k,
             encode_batch_size=args.encode_batch_size,
+            tokenizer_or_path=args.base_llm,
+            max_prompt_length=context_len,
             max_samples=args.max_train_samples,
             leave_one_out=True,
         )
@@ -1231,7 +1609,7 @@ def main():
                 learning_rate=args.sft_lr,
                 per_device_train_batch_size=args.per_device_bs,
                 gradient_accumulation_steps=args.grad_accum,
-                max_prompt_length=1024,
+                max_prompt_length=context_len,
                 max_completion_length=args.max_new_tokens,
                 bf16=False,
                 fp16=torch.cuda.is_available(),
@@ -1251,6 +1629,7 @@ def main():
                 learning_rate=args.lr,
                 per_device_train_batch_size=args.per_device_bs,
                 gradient_accumulation_steps=args.grad_accum,
+                max_prompt_length=context_len,
                 num_generations=args.num_generations,
                 bert_reward_batch_size=args.bert_reward_bs,
                 bf16=False,
