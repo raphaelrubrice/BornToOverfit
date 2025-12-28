@@ -106,7 +106,6 @@ def compute_bertscore_roberta_base(
         "bertscore_f1": float(F1.mean().item()),
     }
 
-
 def evaluate_retrieval_text_metrics(
     results_df: pd.DataFrame,
     test_id2desc: Dict[str, str],
@@ -114,7 +113,10 @@ def evaluate_retrieval_text_metrics(
     save_path: str = None,
 ) -> Dict[str, float]:
     """
-    Align predictions to references by ID, compute BLEU-F1 and BERTScore(roberta-base).
+    Align predictions to references by ID and compute:
+      1. BLEU-4 (Standard)
+      2. BERTScore F1 (RoBERTa-base)
+      3. Final Proxy (Avg of normalized BLEU-4 and BERTScore F1)
     """
     if "ID" not in results_df.columns or "description" not in results_df.columns:
         raise ValueError("results_df must contain columns: 'ID' and 'description'")
@@ -125,30 +127,57 @@ def evaluate_retrieval_text_metrics(
     missing = 0
     for _, row in results_df.iterrows():
         test_id = row["ID"]
-        pred = row["description"]
+        pred = _safe_text(row["description"])
         ref = test_id2desc.get(test_id, None)
+        
         if ref is None:
             missing += 1
-            ref = ""  # keep alignment; alternatively, skip—but then metrics become biased
+            ref = ""
+        else:
+            ref = _safe_text(ref)
+            
         preds.append(pred)
         refs.append(ref)
 
-    bleu_stats = compute_bleu_f1(preds, refs)
-    bert_stats = compute_bertscore_roberta_base(preds, refs, device=device)
+    # --- 1. Compute Standard BLEU-4 ---
+    # sacrebleu.corpus_bleu defaults to 13a tokenizer and max_order=4
+    bleu_res = sacrebleu.corpus_bleu(preds, [refs], lowercase=True)
+    bleu4 = bleu_res.score  # returns score in [0, 100]
 
+    # --- 2. Compute BERTScore (RoBERTa-base) ---
+    bert_stats = compute_bertscore_roberta_base(preds, refs, device=device)
+    bert_f1 = bert_stats["bertscore_f1"]  # returns score in [0, 1]
+
+    # --- 3. Compute Final Proxy ---
+    # Normalize BLEU to [0, 1] range for averaging
+    bleu_norm = bleu4 / 100.0
+    final_proxy = 0.5 * bleu_norm + 0.5 * bert_f1
+
+    # Compile metrics
     metrics = {
         "n_samples": int(len(preds)),
         "n_missing_refs": int(missing),
-        **bleu_stats,
-        **bert_stats,
+        "bleu4": float(bleu4),
+        "bertscore_f1": float(bert_f1),
+        "final_proxy": float(final_proxy),
+        **bert_stats # Includes precision/recall if needed later
     }
 
     print("\n" + "=" * 80)
-    print("Text Retrieval Metrics (retrieved description vs ground-truth test description)")
+    print("Text Retrieval Metrics (retrieved description vs ground-truth)")
     print(f"Samples: {metrics['n_samples']} | Missing refs: {metrics['n_missing_refs']}")
-    print(f"BLEU Precision: {metrics['bleu_precision']:.4f} | BLEU Recall: {metrics['bleu_recall']:.4f} | BLEU-F1: {metrics['bleu_f1']:.4f}")
-    print(f"BERTScore P: {metrics['bertscore_precision']:.4f} | R: {metrics['bertscore_recall']:.4f} | F1: {metrics['bertscore_f1']:.4f}")
+    print("-" * 80)
+    print(f"BLEU-4:       {metrics['bleu4']:.4f}  (Scale 0-100)")
+    print(f"BERTScore F1: {metrics['bertscore_f1']:.4f}  (Scale 0-1)")
+    print("-" * 80)
+    print(f"Final Proxy:  {metrics['final_proxy']:.4f}  (Avg of Norm-BLEU & BERT-F1)")
     print("=" * 80 + "\n")
+
+    # Optional: Print an example for manual inspection
+    if len(preds) > 0:
+        print("Example Prediction:")
+        print(f"PRED: {preds[0][:200]}")
+        print(f"REF : {refs[0][:200]}\n")
 
     if save_path is not None:
         with open(save_path, "w", encoding="utf-8") as f:
