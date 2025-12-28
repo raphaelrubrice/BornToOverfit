@@ -50,6 +50,8 @@ from transformers import (
     GenerationConfig,
     Trainer,
     TrainingArguments,
+    DataCollatorForSeq2Seq, 
+    DataCollatorWithPadding
 )
 
 from peft import LoraConfig, get_peft_model
@@ -78,9 +80,11 @@ from data_baseline.data_utils import (
     PreprocessedGraphDataset,
     collate_fn,
     make_mol_repr,
-    load_mol_cards_from_graphs
+    load_mol_cards_from_graphs,
+    x_map,
+    e_map
 )
-from data_baseline.train_gcn import MolGNN
+from data_baseline.train_gcn import MolGNN, load_gnn_from_checkpoint
 
 _EVAL_AVAILABLE = True
 try:
@@ -473,11 +477,6 @@ def sft_finetune_on_knn(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
     config = AutoConfig.from_pretrained(base_model_name_or_path)
     torch_dtype = torch.bfloat16 if bf16 else (torch.float16 if fp16 else torch.float32)
     device_map = "auto" if torch.cuda.is_available() else None
@@ -494,6 +493,11 @@ def sft_finetune_on_knn(
             torch_dtype=torch_dtype,
             device_map=device_map,
         )
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right" if config.is_encoder_decoder else "left"
 
     if use_lora:
         lora_cfg = LoraConfig(
@@ -522,12 +526,11 @@ def sft_finetune_on_knn(
                 max_length=max_prompt_length,
                 truncation=True,
             )
-            with tokenizer.as_target_tokenizer():
-                labels = tokenizer(
-                    ref,
-                    max_length=max_completion_length,
-                    truncation=True,
-                )["input_ids"]
+            labels = tokenizer(
+                                text_target=ref,
+                                max_length=max_completion_length,
+                                truncation=True,
+                            )["input_ids"]
             model_inputs["labels"] = labels
             return model_inputs
 
@@ -559,25 +562,44 @@ def sft_finetune_on_knn(
         return full
 
     tokenized = train_dataset.map(
-        _tokenize_row,
-        remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "reference")],
-    )
+                                _tokenize_row,
+                                remove_columns=train_dataset.column_names,  # IMPORTANT: drop prompt/reference entirely
+                            )
 
     # ----------------------------
     # Collator (pad inputs + labels)
     # ----------------------------
-    def _collate(features):
-        batch = tokenizer.pad(
-            features,
+    if config.is_encoder_decoder:
+        # Correctly pads labels and sets label_pad_token_id to -100.
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            model=model,
+            padding=True,
+            label_pad_token_id=-100,
+        )
+    else:
+        # Decoder-only: pads input_ids/attention_mask. Labels already contain -100 for prompt tokens,
+        # but they still need padding to the batch max length; pad with -100 to avoid loss on pads.
+        data_collator = DataCollatorWithPadding(
+            tokenizer=tokenizer,
             padding=True,
             return_tensors="pt",
         )
-        # Ensure labels are padded to -100
-        if "labels" in batch:
-            labels = batch["labels"]
-            labels[labels == tokenizer.pad_token_id] = -100
-            batch["labels"] = labels
-        return batch
+
+        # Wrap to also pad labels consistently with -100
+        def _causal_collate(features):
+            batch = data_collator(features)
+
+            if "labels" in batch:
+                # DataCollatorWithPadding will NOT pad labels; do it here.
+                labels = [f["labels"] for f in features]
+                max_len = max(len(l) for l in labels)
+                padded = [l + [-100] * (max_len - len(l)) for l in labels]
+                batch["labels"] = torch.tensor(padded, dtype=torch.long)
+
+            return batch
+
+        data_collator = _causal_collate
 
     # ----------------------------
     # Train
@@ -602,12 +624,17 @@ def sft_finetune_on_knn(
         model=model,
         args=args,
         train_dataset=tokenized,
-        data_collator=_collate,
+        data_collator=data_collator,
         tokenizer=tokenizer,
     )
     trainer.train()
+    
+    # If LoRA was used, merge adapter into the base model and save a full model
+    if use_lora:
+        # PeftModel supports merge_and_unload()
+        model = model.merge_and_unload()
 
-    trainer.save_model(output_dir)
+    model.save_pretrained(output_dir)      # saves config.json + model weights
     tokenizer.save_pretrained(output_dir)
     return output_dir
 
@@ -619,7 +646,7 @@ def finetune_base_model(
     output_dir: str,
     train_dataset: Dataset,
     device: str,
-    rl_algo: str = "grpo",  # user-selectable: "grpo" or "ppo"
+    rl_algo: str = "ppo",
     use_lora: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32,
@@ -664,29 +691,60 @@ def finetune_base_model(
     # Load model(s)
     # ----------------------------
     if rl_algo == "ppo":
-        # PPO needs value head + ref_model for KL control
         if config.is_encoder_decoder:
-            model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(
+            base = AutoModelForSeq2SeqLM.from_pretrained(
                 base_model_name_or_path,
                 torch_dtype=torch_dtype,
                 device_map=device_map,
             )
-            ref_model = AutoModelForSeq2SeqLMWithValueHead.from_pretrained(
+            ref_base = AutoModelForSeq2SeqLM.from_pretrained(
                 base_model_name_or_path,
                 torch_dtype=torch_dtype,
                 device_map=device_map,
             )
+
+            # Apply LoRA BEFORE wrapping with value head
+            if use_lora:
+                lora_cfg = LoraConfig(
+                    r=lora_r,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                    task_type="SEQ_2_SEQ_LM",
+                    target_modules="all-linear",
+                )
+                base = get_peft_model(base, lora_cfg)
+                base.print_trainable_parameters()
+
+            model = AutoModelForSeq2SeqLMWithValueHead(base)
+            ref_model = AutoModelForSeq2SeqLMWithValueHead(ref_base)
+
         else:
-            model = AutoModelForCausalLMWithValueHead.from_pretrained(
+            base = AutoModelForCausalLM.from_pretrained(
                 base_model_name_or_path,
                 torch_dtype=torch_dtype,
                 device_map=device_map,
             )
-            ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+            ref_base = AutoModelForCausalLM.from_pretrained(
                 base_model_name_or_path,
                 torch_dtype=torch_dtype,
                 device_map=device_map,
             )
+
+            if use_lora:
+                lora_cfg = LoraConfig(
+                    r=lora_r,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                    target_modules="all-linear",
+                )
+                base = get_peft_model(base, lora_cfg)
+                base.print_trainable_parameters()
+
+            model = AutoModelForCausalLMWithValueHead(base)
+            ref_model = AutoModelForCausalLMWithValueHead(ref_base)
     else:
         # GRPO (no value head)
         if config.is_encoder_decoder:
@@ -706,20 +764,19 @@ def finetune_base_model(
     # Optional LoRA
     # ----------------------------
     if use_lora:
-        lora_cfg = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM",
-            target_modules="all-linear",
-        )
-        model = get_peft_model(model, lora_cfg)
-        model.print_trainable_parameters()
-
-        if rl_algo == "ppo":
-            # ref_model stays frozen; no LoRA there
-            pass
+        # For PPO, LoRA was already applied to `base` BEFORE wrapping with value head.
+        # Applying LoRA again to the TRL ValueHead wrapper breaks PEFT expectations.
+        if rl_algo == "grpo":
+            lora_cfg = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM",
+                target_modules="all-linear",
+            )
+            model = get_peft_model(model, lora_cfg)
+            model.print_trainable_parameters()
 
     # ----------------------------
     # Reward function (reuse existing)
@@ -791,8 +848,6 @@ def finetune_base_model(
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         seed=seed,
-        log_with=None,
-        optimize_cuda_cache=True,
     )
 
     def _collate(batch):
@@ -1028,7 +1083,7 @@ def main():
         type=str,
         help="HF model name/path (<=1B recommended).",
     )
-    parser.add_argument("--out_llm_dir", default="knn_llm_grpo", type=str, help="Where to save the fine-tuned model")
+    parser.add_argument("--out_llm_dir", default="knn_llm", type=str, help="Where to save the fine-tuned model")
 
     # Actions
     parser.add_argument("--do_finetune", action="store_true", help="Run GRPO fine-tuning")
@@ -1046,7 +1101,7 @@ def main():
 
     parser.add_argument(
         "--rl_algo",
-        default="ppo",
+        default=None,
         choices=["grpo", "ppo"],
         help="RL algorithm: grpo or ppo (seq2seq-friendly).",
     )
@@ -1089,9 +1144,13 @@ def main():
     train_id2emb = load_id2emb(TRAIN_EMB_CSV)
     emb_dim = len(next(iter(train_id2emb.values())))
 
-    gnn = MolGNN(out_dim=emb_dim).to(device)
     print(f"Loading GNN checkpoint: {MODEL_PATH}")
-    gnn.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    gnn = load_gnn_from_checkpoint(
+        model_path=MODEL_PATH,
+        device=device,
+        x_map=x_map,
+        e_map=e_map,
+    )
     gnn.eval()
 
     # Fine-tune
@@ -1112,12 +1171,12 @@ def main():
         )
         print(f"KNN dataset size: {len(knn_ds)}")
 
-        start_model = args.base_llm
+        llm_dir = args.base_llm
 
         if args.do_sft:
             sft_dir = str(base_path / (args.out_llm_dir + "_sft"))
             print(f"Running SFT -> {sft_dir}")
-            start_model = sft_finetune_on_knn(
+            llm_dir = sft_finetune_on_knn(
                 base_model_name_or_path=args.base_llm,
                 output_dir=sft_dir,
                 train_dataset=knn_ds,
@@ -1132,25 +1191,27 @@ def main():
                 bf16=False,
                 fp16=torch.cuda.is_available(),
             )
-            print(f"SFT model saved to: {start_model}")
+            print(f"SFT model saved to: {llm_dir}")
 
-        print("Running RL fine-tuning...")
-        llm_dir = finetune_base_model(
-            base_model_name_or_path=start_model,  # NOTE: SFT output if --do_sft, else base_llm
-            output_dir=str((base_path / args.out_llm_dir)),
-            train_dataset=knn_ds,
-            device=device,
-            use_lora=use_lora,
-            num_train_steps=args.steps,
-            learning_rate=args.lr,
-            per_device_train_batch_size=args.per_device_bs,
-            gradient_accumulation_steps=args.grad_accum,
-            num_generations=args.num_generations,
-            bert_reward_batch_size=args.bert_reward_bs,
-            bf16=False,
-            fp16=torch.cuda.is_available(),
-        )
-        print(f"Saved fine-tuned model to: {llm_dir}")
+        if args.rl_algo is not None:
+            print("Running RL fine-tuning...")
+            llm_dir = finetune_base_model(
+                base_model_name_or_path=start_model,  # NOTE: SFT output if --do_sft, else base_llm
+                output_dir=str((base_path / args.out_llm_dir)),
+                train_dataset=knn_ds,
+                device=device,
+                rl_algo=args.rl_algo,
+                use_lora=use_lora,
+                num_train_steps=args.steps,
+                learning_rate=args.lr,
+                per_device_train_batch_size=args.per_device_bs,
+                gradient_accumulation_steps=args.grad_accum,
+                num_generations=args.num_generations,
+                bert_reward_batch_size=args.bert_reward_bs,
+                bf16=False,
+                fp16=torch.cuda.is_available(),
+            )
+            print(f"Saved fine-tuned model to: {llm_dir}")
 
     # Generate
     if args.do_generate:
