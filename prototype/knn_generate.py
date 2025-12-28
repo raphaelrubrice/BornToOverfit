@@ -6,9 +6,7 @@ kNN + LLM generation with GRPO fine-tuning (TRL).
 
 Key design choices:
 - Retrieval/prompting uses your existing GNN embedding space (MolGNN) + train text embeddings.
-- Base generative model: a light modern HF instruct model (<= 1B params) by default:
-    "Qwen/Qwen2-0.5B-Instruct"
-- Fine-tuning: TRL's GRPOTrainer (Group Relative Policy Optimization).
+- Base generative model: a light modern HF instruct model (<= 1B params)
 - Reward: heavy penalty if not exact match, plus informative shaping using BLEU-F1 + BERTScore(roberta-base).
 
 This file contains:
@@ -34,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from argparse import ArgumentParser
 from typing import Dict, List, Tuple, Optional
+from tqdm.auto import tqdm
 
 import pandas as pd
 import torch
@@ -947,9 +946,11 @@ def generate_desc(
     query_id2card = load_mol_cards_from_graphs(query_graphs)
 
     # Encode query
+    print("Encoding query..")
     query_embs, query_ids = encode_graphs(gnn_model, query_graphs, device=device, batch_size=encode_batch_size)
 
     # Retrieve KNN
+    print(f"Retrieving top {k} neighbors..")
     top_idx, top_sims = knn_topk(query_embs, train_embs, k=k)
     top_idx = top_idx.cpu().tolist()
     top_sims = top_sims.cpu().tolist()
@@ -958,7 +959,7 @@ def generate_desc(
     nn_ids_all: List[List[str]] = []
     sims_all: List[List[float]] = []
 
-    for i in range(len(query_ids)):
+    for i in tqdm(list(range(len(query_ids))), desc="Building prompts.."):
         qid = query_ids[i]
 
         nn_ids = [train_ids[j] for j in top_idx[i]]
@@ -971,16 +972,37 @@ def generate_desc(
         nn_ids_all.append(nn_ids)
         sims_all.append([float(s) for s in top_sims[i]])
 
-    # Load LLM
+    # ----------------------------
+    # Load LLM (Seq2Seq or CausalLM)
+    # ----------------------------
     tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
+
+    # Ensure pad token exists (required for batching)
     if tokenizer.pad_token is None:
+        # Common fallback; works for most decoder-only and many encoder-decoder setups
         tokenizer.pad_token = tokenizer.eos_token
 
-    llm = AutoModelForCausalLM.from_pretrained(
-        llm_dir_or_name,
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    config = AutoConfig.from_pretrained(llm_dir_or_name)
+    is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
+
+    tokenizer.padding_side = "right" if is_seq2seq else "left"
+    
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    device_map = "auto" if torch.cuda.is_available() else None
+
+    if is_seq2seq:
+        llm = AutoModelForSeq2SeqLM.from_pretrained(
+            llm_dir_or_name,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+        )
+    else:
+        llm = AutoModelForCausalLM.from_pretrained(
+            llm_dir_or_name,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+        )
+
     llm.eval()
 
     gen_cfg = GenerationConfig(
@@ -992,13 +1014,18 @@ def generate_desc(
         eos_token_id=tokenizer.eos_token_id,
     )
 
+    # ----------------------------
     # Batch generation
-    generations: List[str] = []
-    for start in range(0, len(prompts_text), gen_batch_size):
-        batch_prompts = prompts_text[start:start + gen_batch_size]
+    # ----------------------------
+    use_chat_template = bool(
+        hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None)
+    )
 
-        # For instruct chat models, apply chat template if available
-        if hasattr(tokenizer, "apply_chat_template"):
+    generations: List[str] = []
+    for start in tqdm(list(range(0, len(prompts_text), gen_batch_size)), desc="Generating.."):
+        batch_prompts = prompts_text[start : start + gen_batch_size]
+
+        if use_chat_template:
             batch_msgs = [prompt_as_chat(p) for p in batch_prompts]
             input_ids = tokenizer.apply_chat_template(
                 batch_msgs,
@@ -1008,11 +1035,23 @@ def generate_desc(
                 padding=True,
                 truncation=True,
             ).to(llm.device)
+
             attention_mask = (input_ids != tokenizer.pad_token_id).long()
-            outputs = llm.generate(input_ids=input_ids, attention_mask=attention_mask, generation_config=gen_cfg)
-            # Strip the prompt portion
-            gen_only = outputs[:, input_ids.shape[1]:]
-            texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
+            outputs = llm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=gen_cfg,
+            )
+
+            if is_seq2seq:
+                # Seq2Seq: decode full sequences
+                texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            else:
+                # CausalLM: strip prompt tokens
+                gen_only = outputs[:, input_ids.shape[1] :]
+                texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
         else:
             enc = tokenizer(
                 batch_prompts,
@@ -1020,15 +1059,20 @@ def generate_desc(
                 padding=True,
                 truncation=True,
             ).to(llm.device)
+
             outputs = llm.generate(**enc, generation_config=gen_cfg)
-            gen_only = outputs[:, enc["input_ids"].shape[1]:]
-            texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+
+            if is_seq2seq:
+                texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            else:
+                gen_only = outputs[:, enc["input_ids"].shape[1] :]
+                texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
 
         generations.extend([t.strip() for t in texts])
 
     # Write CSV
     rows = []
-    for i, qid in enumerate(query_ids):
+    for i, qid in tqdm(enumerate(query_ids), desc='Creating the DataFrame..'):
         row = {
             "ID": qid,
             "Prompt": prompts_text[i],
@@ -1041,6 +1085,7 @@ def generate_desc(
 
     df = pd.DataFrame(rows)
     os.makedirs(str(Path(out_csv).parent), exist_ok=True)
+    print("Writing to CSV..")
     df.to_csv(out_csv, index=False)
     print(f"Saved generations to: {out_csv}")
 
@@ -1096,8 +1141,8 @@ def main():
 
     # Generation split
     parser.add_argument("--split", default="test", choices=["validation", "val", "test"])
-    parser.add_argument("--gen_batch_size", default=8, type=int)
-    parser.add_argument("--max_new_tokens", default=192, type=int)
+    parser.add_argument("--gen_batch_size", default=4, type=int)
+    parser.add_argument("--max_new_tokens", default=256, type=int)
 
     parser.add_argument(
         "--rl_algo",
@@ -1196,7 +1241,7 @@ def main():
         if args.rl_algo is not None:
             print("Running RL fine-tuning...")
             llm_dir = finetune_base_model(
-                base_model_name_or_path=start_model,  # NOTE: SFT output if --do_sft, else base_llm
+                base_model_name_or_path=llm_dir,  # NOTE: SFT output if --do_sft, else base_llm
                 output_dir=str((base_path / args.out_llm_dir)),
                 train_dataset=knn_ds,
                 device=device,
