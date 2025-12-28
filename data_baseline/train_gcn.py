@@ -211,7 +211,7 @@ def eval_retrieval(data_path, emb_dict, mol_enc, device, dl=None):
 
     return results
 
-def load_gnn_from_checkpoint(
+def load_molgnn_from_checkpoint(
     model_path: str,
     device: str,
     x_map,

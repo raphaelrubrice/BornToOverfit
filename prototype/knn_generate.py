@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
@@ -66,7 +67,11 @@ from data_baseline.data_utils import (
     x_map,
     e_map
 )
-from data_baseline.train_gcn import MolGNN, load_gnn_from_checkpoint
+from data_baseline.train_gcn import MolGNN, load_molgnn_from_checkpoint
+from data_baseline.train_gcn_v3_gps import MolGNN_GPS, load_molgnn_gps_from_checkpoint
+
+SUPPORTED_GNNS = {"MolGNN":load_molgnn_from_checkpoint, 
+                "MolGNN_GPS":load_molgnn_gps_from_checkpoint}
 
 _EVAL_AVAILABLE = True
 try:
@@ -149,8 +154,18 @@ def prompt_as_chat(prompt_text: str) -> List[Dict[str, str]]:
 # --------------------------------------------------------------------------------------
 # GNN encoding + KNN retrieval
 # --------------------------------------------------------------------------------------
+GNN_LOADING_FUNCS = [load_molgnn_from_checkpoint,load_molgnn_gps_from_checkpoint]
+
+def load_gnn_from_checkpoint(*args, **kwargs):
+    for func in GNN_LOADING_FUNCS:
+        try:
+            return func(*args, **kwargs)
+        except:
+            pass
+    raise ValueError(f"All attempted loading methods failed.")
+
 @torch.no_grad()
-def encode_graphs(model: MolGNN, graph_pkl: str, device: str, batch_size: int = 64) -> Tuple[torch.Tensor, List[str]]:
+def encode_graphs(model: nn.Module, graph_pkl: str, device: str, batch_size: int = 64) -> Tuple[torch.Tensor, List[str]]:
     ds = PreprocessedGraphDataset(graph_pkl)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -490,7 +505,7 @@ def make_reward_fn(device: str, bert_batch_size: int = 32):
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def build_knn_prompt_dataset(
-    gnn_model: MolGNN,
+    gnn_model: nn.Module,
     train_graphs: str,
     train_emb_csv: str,
     device: str,
@@ -1218,7 +1233,7 @@ def main():
         # [START] Bring GNN back to GPU
         gnn.to(device) 
         # [END]
-        
+
         print(f"Generating with model: {llm_path}")
         generate_desc(gnn_model=gnn, llm_dir_or_name=llm_path, train_graphs=TRAIN_GRAPHS, 
                       query_graphs=query_graphs, train_emb_csv=TRAIN_EMB_CSV, device=device, 

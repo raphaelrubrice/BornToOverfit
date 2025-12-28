@@ -80,7 +80,7 @@ class BondEncoder(nn.Module):
 # =========================================================
 # MODEL: GPS Transformer
 # =========================================================
-class MolGNN(nn.Module):
+class MolGNN_GPS(nn.Module):
     """
     GPS = MPNN local (GINEConv) + Global Attention (Transformer).
     Captures both local structure and long-range dependencies.
@@ -182,6 +182,44 @@ def eval_retrieval(data_path, emb_dict, mol_enc, device):
         results[f"R@{k}"] = (pos <= k).float().mean().item()
     return results
 
+def load_molgnn_gps_from_checkpoint(
+    model_path: str,
+    device: str,
+    x_map,
+    e_map,
+):
+    """
+    Load MolGNN using a saved config + state_dict.
+    """
+    model_dir = Path(model_path).parent
+    config_path = model_dir / "model_config.json"
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Missing GNN config file: {config_path}"
+        )
+
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    model_class = cfg.get("model_class", "MolGNN")
+
+    if model_class != "MolGNN":
+        raise ValueError(f"Unsupported GNN class: {model_class}")
+
+    gnn = MolGNN_GPS(
+        hidden=cfg["hidden"],
+        out_dim=cfg["out_dim"],
+        layers=cfg["layers"],
+        x_map=x_map,
+        e_map=e_map,
+    ).to(device)
+
+    state = torch.load(model_path, map_location=device)
+    gnn.load_state_dict(state)
+    gnn.eval()
+
+    return gnn
 
 def main(data_folder, output_folder):
     # Setup Paths
@@ -220,8 +258,11 @@ def main(data_folder, output_folder):
     train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
+    val_ds = PreprocessedGraphDataset(VAL_GRAPHS, val_emb)
+    val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+
     # Initialize Model
-    mol_enc = MolGNN(
+    mol_enc = MolGNN_GPS(
         hidden_dim=HIDDEN_DIM, 
         out_dim=emb_dim, 
         num_layers=NUM_LAYERS, 
@@ -242,7 +283,7 @@ def main(data_folder, output_folder):
     # Training Loop
     for ep in range(EPOCHS):
         loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
-        val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE) if val_emb else {}
+        val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE, dl=val_dl) if val_emb else {}
         
         str_val = " | ".join([f"{k}: {v:.4f}" for k, v in val_scores.items()])
         print(f"Epoch {ep+1}/{EPOCHS} | loss={loss:.4f} | {str_val}")
