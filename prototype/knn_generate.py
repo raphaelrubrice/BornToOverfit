@@ -170,12 +170,56 @@ def encode_graphs(model: MolGNN, graph_pkl: str, device: str, batch_size: int = 
     embs = torch.cat(all_embs, dim=0)
     return embs, all_ids
 
-def knn_topk(query_embs_norm, train_embs_norm, k, mask_self=None):
-    sims = query_embs_norm @ train_embs_norm.t()
-    if mask_self is not None:
-        sims = sims.masked_fill(mask_self, float("-inf"))
-    k_eff = min(k, sims.size(1))
-    top_sims, top_idx = torch.topk(sims, k=k_eff, dim=-1, largest=True, sorted=True)
+# def knn_topk(query_embs_norm, train_embs_norm, k, mask_self=None):
+#     sims = query_embs_norm @ train_embs_norm.t()
+#     if mask_self is not None:
+#         sims = sims.masked_fill(mask_self, float("-inf"))
+#     k_eff = min(k, sims.size(1))
+#     top_sims, top_idx = torch.topk(sims, k=k_eff, dim=-1, largest=True, sorted=True)
+#     return top_idx, top_sims
+
+def knn_topk(
+    query_embs_norm: torch.Tensor,
+    train_embs_norm: torch.Tensor,
+    k: int,
+    mask_self: Optional[torch.Tensor] = None,
+    batch_size: int = 4096  # Process 4096 queries at a time
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched KNN to prevent OOM / Memory Fragmentation on large datasets.
+    """
+    num_queries = query_embs_norm.size(0)
+    all_top_idx = []
+    all_top_sims = []
+
+    # Process queries in chunks
+    for start in range(0, num_queries, batch_size):
+        end = min(start + batch_size, num_queries)
+        
+        # 1. Compute similarities for just this batch [Batch_Size, N_train]
+        q_batch = query_embs_norm[start:end] 
+        sims = q_batch @ train_embs_norm.t() 
+        
+        # 2. Apply mask if needed (Slice the mask for this batch)
+        if mask_self is not None:
+            mask_batch = mask_self[start:end]
+            sims = sims.masked_fill(mask_batch, float("-inf"))
+
+        # 3. Top-K for this batch (results are small tensors)
+        k_eff = min(k, sims.size(1))
+        batch_sims, batch_idx = torch.topk(sims, k=k_eff, dim=-1, largest=True, sorted=True)
+        
+        # 4. Move small results to CPU immediately to free GPU memory
+        all_top_idx.append(batch_idx.cpu())
+        all_top_sims.append(batch_sims.cpu())
+        
+        # Explicitly delete intermediates to help the allocator
+        del sims, batch_idx, batch_sims, q_batch
+    
+    # Concatenate all results
+    top_idx = torch.cat(all_top_idx, dim=0)
+    top_sims = torch.cat(all_top_sims, dim=0)
+    
     return top_idx, top_sims
 
 def compute_similarity_thresholds(sims_tensor: torch.Tensor) -> List[float]:
@@ -1117,6 +1161,26 @@ def main():
                                           device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
                                           tokenizer_or_path=args.base_llm, thresholds=global_thresholds, max_prompt_length=context_len, 
                                           max_samples=args.max_train_samples, leave_one_out=True)
+        
+        print("Optimizing memory for SFT...")
+        
+        # 1. Move GNN to CPU (Don't delete it, just get it off the GPU)
+        gnn.cpu()
+        
+        # 2. Clear Python variables holding GPU tensors
+        # (train_id2emb holds text embeddings on GPU, we don't need them for SFT)
+        if 'train_id2emb' in locals():
+            del train_id2emb 
+            
+        # 3. Force PyTorch to release "Reserved" memory back to the OS
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        print(f"GPU Memory Free: {torch.cuda.mem_get_info()[0] / 1e9:.2f} GB")
+        # =========================================================
+        # [END] MEMORY OPTIMIZATION BLOCK
+
         llm_dir = args.base_llm
         if args.do_sft:
             sft_dir = str(base_path / (args.out_llm_dir + "_sft"))
@@ -1150,6 +1214,11 @@ def main():
         if not os.path.isabs(llm_path):
             candidate = base_path / llm_path
             if candidate.exists(): llm_path = str(candidate)
+        
+        # [START] Bring GNN back to GPU
+        gnn.to(device) 
+        # [END]
+        
         print(f"Generating with model: {llm_path}")
         generate_desc(gnn_model=gnn, llm_dir_or_name=llm_path, train_graphs=TRAIN_GRAPHS, 
                       query_graphs=query_graphs, train_emb_csv=TRAIN_EMB_CSV, device=device, 
