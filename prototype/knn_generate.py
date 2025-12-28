@@ -3,35 +3,17 @@
 knn_generate.py
 
 kNN + LLM generation with GRPO fine-tuning (TRL).
-
-Key design choices:
-- Retrieval/prompting uses existing GNN embedding space (MolGNN) + train text embeddings.
-- Base generative model: a light modern HF instruct model (<= 1B params)
-- Reward: heavy penalty if not exact match, plus informative shaping using BLEU-F1 + BERTScore(roberta-base).
-
-This file contains:
-  - finetune_base_model(...) : GRPO post-training on a kNN-prompt-to-description task
-  - generate_desc(...)       : batch generation on validation/test
-  - a CLI entrypoint to run finetuning and/or generation.
-
-Dependencies:
-  pip install -U transformers datasets accelerate trl peft sacrebleu bert-score
-
-Notes:
-- GRPO is online RL; reward functions must be efficient. BERTScore is expensive; this prototype uses
-  batched computation and suggests small batch sizes.
-- This is a prototype. For serious training runs: use LoRA, bf16/fp16, gradient checkpointing,
-  and consider running reward metrics on a subset or replacing BERTScore with a learned reward model.
-
+Optimized for speed by caching token lengths.
 """
 
 import os
 import re
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from argparse import ArgumentParser
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from tqdm.auto import tqdm
 
 import pandas as pd
@@ -68,7 +50,7 @@ from trl import (
 import sacrebleu
 from bert_score import score as bertscore
 
-import sys, os
+import sys
 # To ensure the custom package is found
 path_to_repo = "/".join(os.path.abspath(__file__).split("/")[:-2])
 if path_to_repo not in sys.path:
@@ -88,110 +70,81 @@ from data_baseline.train_gcn import MolGNN, load_gnn_from_checkpoint
 
 _EVAL_AVAILABLE = True
 try:
-    from data_baseline.retrieval_answer import evaluate_retrieval_text_metrics  # :contentReference[oaicite:0]{index=0}
+    from data_baseline.retrieval_answer import evaluate_retrieval_text_metrics 
 except Exception:
     _EVAL_AVAILABLE = False
+
+# --------------------------------------------------------------------------------------
+# Optimization: Token Length Cache
+# --------------------------------------------------------------------------------------
+class TokenLengthCache:
+    """
+    Pre-computes and caches token lengths for strings to avoid 
+    repeated CPU-bound tokenizer calls during prompt construction.
+    """
+    def __init__(self, tokenizer, data_dict: Dict[str, str], description: str = "Pre-computing lengths"):
+        self.cache = {}
+        self.tokenizer = tokenizer
+        
+        # Batch tokenization is much faster than sequential
+        keys = list(data_dict.keys())
+        texts = [str(data_dict[k]) for k in keys]
+        
+        # We use a simple approximation or batch encode. 
+        # To be perfectly safe and fast, we iterate but simply.
+        print(f"[{description}] Caching token counts for {len(texts)} items...")
+        
+        # Fast batch encoding (no padding needed for count, just raw IDs)
+        # We do it in chunks to avoid memory spikes
+        batch_size = 1000
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            batch_enc = tokenizer(batch_texts, add_special_tokens=False, verbose=False)
+            
+            for j, ids in enumerate(batch_enc["input_ids"]):
+                original_key = keys[i + j]
+                self.cache[original_key] = len(ids)
+
+    def get_len(self, key: str) -> int:
+        return self.cache.get(key, 0)
+    
+    def estimate_text_len(self, text: str) -> int:
+        """Fallback for non-cached text"""
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
 
 # --------------------------------------------------------------------------------------
 # Helper: Dynamic Context Length Detection
 # --------------------------------------------------------------------------------------
 def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
-    """
-    Robustly determine a safe context length for the model.
-    Checks config for 'max_position_embeddings', 'n_positions', 'seq_length'.
-    Caps the value at 'cap' to prevent OOM on consumer hardware (default 4096).
-    """
     try:
         config = AutoConfig.from_pretrained(model_name_or_path)
-        # Check common attributes for context length
         possible_limits = [
             getattr(config, "max_position_embeddings", None),
-            getattr(config, "n_positions", None), # GPT-2 / older models
-            getattr(config, "seq_length", None),  # Some specialized models
+            getattr(config, "n_positions", None),
+            getattr(config, "seq_length", None),
             getattr(config, "max_seq_len", None), 
         ]
-        
-        # Filter out None and take the maximum found
         valid_limits = [x for x in possible_limits if x is not None and isinstance(x, int)]
-        limit = max(valid_limits) if valid_limits else 1024 # Fallback to 1024 if nothing found
+        limit = max(valid_limits) if valid_limits else 1024 
         
-        # Double check tokenizer if the config gave a generic default or failed
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
             if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 1e9:
-                # Some tokenizers return huge ints for "unlimited"; ignore those
                 limit = max(limit, tokenizer.model_max_length)
         except Exception:
             pass
 
         print(f" [Context Detection] Model native limit: {limit}")
-        
         if limit > cap:
             print(f" [Context Detection] Capping context to {cap} for memory safety.")
             return cap
-            
         return limit
-
     except Exception as e:
         print(f" [Context Detection] Warning: Could not auto-detect. Error: {e}")
-        print(" [Context Detection] Defaulting to 1024.")
         return 1024
-    
-# --------------------------------------------------------------------------------------
-# Prompting utilities
-# --------------------------------------------------------------------------------------
-def build_prompt(query_card, neighbor_descs: List[str], neighbor_cards: List[str]) -> str:
-    lines = []
-    lines.append("Here are the descriptions of the K nearest molecules to the query molecule from nearest to furthest.")
-    for d in neighbor_descs:
-        lines.append(d)
-    lines.append("Based on previous descriptions, generate the accurate description of the query molecule.")
-    return "\n".join(lines)
-
-# Here are Molecule Card and Description pairs for the K nearest neighbors to the query molecule in training data ....
-# Molecule Card Neighbor 1
-# Description Neighbor 1
-# ...
-# Now, here is the Molecule Card of the query molecule. Generate the accurate description of this molecule.
-# Molecule Card Query
-def build_prompt(query_card: str, neighbor_descs: List[str], neighbor_cards: List[str]) -> str:
-    """
-    New prompting approach:
-      - Provide (card, description) pairs for each neighbor
-      - Provide the query molecule card
-      - Explicit instruction to treat MOL_FEATURES as constraints and neighbors as examples
-    """
-    lines: List[str] = []
-    lines.append(
-        "You are given molecule 'info cards' and descriptions for K nearest neighbor molecules from training data."
-    )
-    lines.append("Use them as examples and evidence, but follow the query molecule card as the factual constraint.")
-    lines.append("Do not assert elements, charge sign, aromaticity, or ring presence that contradict the query card.")
-    lines.append("")
-
-    lines.append("[NEIGHBORS]")
-    for i, (c, d) in enumerate(zip(neighbor_cards, neighbor_descs), start=1):
-        lines.append(f"Neighbor {i} - Molecule Card:")
-        lines.append(c.strip() if c else "[MOL_FEATURES]\nunknown\n[/MOL_FEATURES]")
-        lines.append(f"Neighbor {i} - Description:")
-        lines.append((d or "").strip())
-        lines.append("")
-    lines.append("[/NEIGHBORS]")
-    lines.append("")
-
-    lines.append("Query Molecule Card:")
-    lines.append(query_card.strip() if query_card else "[MOL_FEATURES]\nunknown\n[/MOL_FEATURES]")
-    lines.append("")
-    lines.append("Task: Give an accurate, factual and concise description of the query molecule in the same style as the training descriptions.")
-    return "\n".join(lines)
 
 def prompt_as_chat(prompt_text: str) -> List[Dict[str, str]]:
-    """
-    Return a chat-style prompt in the format used by instruct chat models in TRL docs:
-      [{"role": "user", "content": "..."}]
-    """
     return [{"role": "user", "content": prompt_text}]
-
 
 # --------------------------------------------------------------------------------------
 # GNN encoding + KNN retrieval
@@ -217,222 +170,61 @@ def encode_graphs(model: MolGNN, graph_pkl: str, device: str, batch_size: int = 
     embs = torch.cat(all_embs, dim=0)
     return embs, all_ids
 
-
-def knn_topk(
-    query_embs_norm: torch.Tensor,
-    train_embs_norm: torch.Tensor,
-    k: int,
-    mask_self: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns:
-      top_idx: [Nq, k]
-      top_sims: [Nq, k]
-    mask_self:
-      Optional boolean mask [Nq, Nt] where True positions are disallowed (set sim=-inf).
-      Used for leave-one-out on training.
-    """
-    sims = query_embs_norm @ train_embs_norm.t()  # [Nq, Nt]
+def knn_topk(query_embs_norm, train_embs_norm, k, mask_self=None):
+    sims = query_embs_norm @ train_embs_norm.t()
     if mask_self is not None:
         sims = sims.masked_fill(mask_self, float("-inf"))
-
     k_eff = min(k, sims.size(1))
     top_sims, top_idx = torch.topk(sims, k=k_eff, dim=-1, largest=True, sorted=True)
     return top_idx, top_sims
 
 def compute_similarity_thresholds(sims_tensor: torch.Tensor) -> List[float]:
-    """
-    Computes 20th, 40th, 60th, 80th percentiles of the similarity distribution.
-    Args:
-        sims_tensor: Tensor of shape [N, k] containing cosine similarities.
-    Returns:
-        List of 4 thresholds [q20, q40, q60, q80]
-    """
-    # Flatten to get global distribution of "neighbor matches"
     flat_sims = sims_tensor.view(-1).float()
     quantiles = torch.tensor([0.2, 0.4, 0.6, 0.8], device=flat_sims.device)
     thresholds = torch.quantile(flat_sims, quantiles)
     return thresholds.cpu().tolist()
 
 def get_closeness_tag(sim: float, thresholds: List[float]) -> str:
-    """
-    Maps a similarity score to a closeness tag based on thresholds.
-    Thresholds: [very_distant_upper, distant_upper, average_upper, close_upper]
-    """
-    # Thresholds are q20, q40, q60, q80.
-    # q80 means 80% of data is below this value -> Top 20% are > q80
     q20, q40, q60, q80 = thresholds
-    
-    if sim >= q80:
-        return "[VERY_CLOSE]"
-    elif sim >= q60:
-        return "[CLOSE]"
-    elif sim >= q40:
-        return "[AVERAGE]"
-    elif sim >= q20:
-        return "[DISTANT]"
-    else:
-        return "[VERY_DISTANT]"
+    if sim >= q80: return "[VERY_CLOSE]"
+    elif sim >= q60: return "[CLOSE]"
+    elif sim >= q40: return "[AVERAGE]"
+    elif sim >= q20: return "[DISTANT]"
+    else: return "[VERY_DISTANT]"
+
+def save_thresholds(thresholds: List[float], path: str):
+    with open(path, 'w') as f:
+        json.dump(thresholds, f)
+    print(f"Saved similarity thresholds to {path}: {thresholds}")
+
+def load_thresholds(path: str) -> List[float]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Thresholds file not found at {path}. Run training first or ensure file exists.")
+    with open(path, 'r') as f:
+        t = json.load(f)
+    print(f"Loaded similarity thresholds from {path}: {t}")
+    return t
 
 # --------------------------------------------------------------------------------------
-# Rewards: BLEU-F1 + BERTScore(roberta-base) + exact match penalty
+# Optimized Prompt Builder
 # --------------------------------------------------------------------------------------
-_WS_RE = re.compile(r"\s+")
 
-
-def _normalize_text(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip().lower()
-    s = _WS_RE.sub(" ", s)
-    return s
-
-
-def bleu_f1_corpus(preds: List[str], refs: List[str], tokenize: str = "13a") -> float:
-    """
-    BLEU-F1 in [0, 1].
-      precision proxy: BLEU(preds, refs)
-      recall proxy:    BLEU(refs, preds)
-    """
-    preds = [p.lower() for p in preds]
-    refs = [r.lower() for r in refs]
-    bleu_p = sacrebleu.corpus_bleu(preds, [refs], tokenize=tokenize).score
-    bleu_r = sacrebleu.corpus_bleu(refs, [preds], tokenize=tokenize).score
-    denom = (bleu_p + bleu_r)
-    bleu_f1 = (2.0 * bleu_p * bleu_r / denom) if denom > 0 else 0.0
-    return float(bleu_f1 / 100.0)
-
-
-@torch.no_grad()
-def bertscore_f1_roberta_base(
-    preds: List[str],
-    refs: List[str],
-    device: str,
-    batch_size: int = 32,
-) -> float:
-    """
-    Mean BERTScore F1 in [0, 1], using roberta-base.
-    """
-    P, R, F1 = bertscore(
-        cands=preds,
-        refs=refs,
-        model_type="roberta-base",
-        lang="en",
-        device=device,
-        batch_size=batch_size,
-        idf=False,
-        verbose=False,
-        rescale_with_baseline=False,
-    )
-    return float(F1.mean().item())
-
-def bleu_f1_sentence(pred: str, ref: str, tokenize: str = "13a") -> float:
-    """
-    Per-sample BLEU-F1 in [0, 1].
-      precision proxy: sentence_bleu(pred, [ref])
-      recall proxy:    sentence_bleu(ref, [pred])
-    """
-    pred_l = (pred or "").lower()
-    ref_l = (ref or "").lower()
-
-    bleu_p = sacrebleu.sentence_bleu(pred_l, [ref_l], tokenize=tokenize).score
-    bleu_r = sacrebleu.sentence_bleu(ref_l, [pred_l], tokenize=tokenize).score
-
-    denom = bleu_p + bleu_r
-    bleu_f1 = (2.0 * bleu_p * bleu_r / denom) if denom > 0 else 0.0
-    return float(bleu_f1 / 100.0)
-
-class CachedBERTScorer:
-    """
-    Cache RoBERTa model/tokenizer to avoid re-loading BERTScore at every RL step.
-    Computes per-sample BERTScore F1.
-    """
-    def __init__(self, device: str, batch_size: int = 32):
-        from bert_score import BERTScorer
-
-        self.device = device
-        self.batch_size = batch_size
-
-        # BERTScorer internally caches the model/tokenizer after construction
-        self.scorer = BERTScorer(
-            model_type="roberta-base",
-            lang="en",
-            device=device,
-            batch_size=batch_size,
-            idf=False,
-            rescale_with_baseline=False,
-        )
-
-    @torch.no_grad()
-    def score_f1(self, preds: List[str], refs: List[str]) -> List[float]:
-        """
-        Returns per-sample BERTScore F1 in [0, 1].
-        """
-        P, R, F1 = self.scorer.score(preds, refs)
-        return F1.detach().cpu().tolist()
-
-def make_reward_fn(
-    device: str,
-    bleu_weight: float = 0.45,
-    bert_weight: float = 0.55,
-    exact_bonus: float = 1.0,
-    exact_penalty: float = 1.0,
-    bert_batch_size: int = 32,
-):
-    """
-    GRPO reward with:
-      - per-sample BLEU-F1
-      - per-sample BERTScore F1
-      - cached RoBERTa model
-      - exact-match shaping
-
-    This guarantees non-zero reward variance within GRPO groups.
-    """
-    bert_scorer = CachedBERTScorer(device=device, batch_size=bert_batch_size)
-
-    def reward_fn(completions, reference, **kwargs):
-        preds = [c[0]["content"] for c in completions]
-        refs = list(reference)
-
-        n = min(len(preds), len(refs))
-        preds = preds[:n]
-        refs = refs[:n]
-
-        # Exact match (per sample)
-        exact = [
-            1 if _normalize_text(p) == _normalize_text(r) and len(_normalize_text(r)) > 0 else 0
-            for p, r in zip(preds, refs)
-        ]
-
-        # Per-sample metrics
-        bleu_scores = [bleu_f1_sentence(p, r) for p, r in zip(preds, refs)]
-        bert_scores = bert_scorer.score_f1(preds, refs)
-
-        rewards = []
-        for ex, b, bf in zip(exact, bleu_scores, bert_scores):
-            em_term = exact_bonus if ex == 1 else -exact_penalty
-            shaped = bleu_weight * b + bert_weight * bf
-            rewards.append(float(em_term + shaped))
-
-        # Stabilization
-        return [max(-2.0, min(2.0, r)) for r in rewards]
-
-    return reward_fn
-
-
-def fit_neighbors_efficiently(
+def fit_neighbors_fast(
     tokenizer,
     query_card: str,
+    neighbor_ids: List[str],
     neighbor_descs: List[str],
     neighbor_cards: List[str],
-    neighbor_tags: List[str], # <--- NEW ARGUMENT
+    neighbor_tags: List[str],
+    desc_cache: TokenLengthCache,
+    card_cache: TokenLengthCache,
     max_length: int = 1024
 ) -> str:
     """
-    Includes Closeness Tags to nuance the model's reliance on neighbors.
+    Constructs prompt using pre-computed token lengths (integer math) 
+    instead of repeated tokenization.
     """
     
-    # --- 1. Meta-Cognitive Instructions ---
     base_instruction = (
         "You are an expert chemist. Generate a factual description of the Query Molecule based on its feature card.\n"
         "You are provided with K nearest neighbors, tagged by their similarity (e.g., [VERY_CLOSE], [DISTANT]).\n\n"
@@ -443,41 +235,41 @@ def fit_neighbors_efficiently(
         "**Strict Constraint**: The 'Query Molecule Card' is the ground truth. Never hallucinate features from neighbors that contradict the card."
     )
 
-    # --- 2. Compact Data Templates with Tags ---
-    neighbor_template = (
-        "\n[NEIGHBOR_{i} {tag}]\n" 
-        "Card: {card}\n"
-        "Description: {desc}"
-    )
-    
     footer = (
         "\n\n[QUERY MOLECULE]\n"
         f"Card: {query_card.strip() if query_card else 'UNKNOWN'}\n"
         "Description:" 
     )
 
-    # --- 3. Assembly (Same budget logic as before) ---
-    base_prompt_structure = f"{base_instruction}\n[CONTEXT]\n[/CONTEXT]{footer}"
-    static_tokens = len(tokenizer.encode(base_prompt_structure, add_special_tokens=False))
-    remaining_budget = max_length - static_tokens - 20
+    # Estimate static parts once (approx overhead)
+    # We cache this locally to avoid re-encoding constant strings
+    if not hasattr(fit_neighbors_fast, "static_overhead"):
+        fit_neighbors_fast.static_overhead = len(tokenizer.encode(base_instruction + "\n[CONTEXT]\n[/CONTEXT]" + footer, add_special_tokens=False))
+        # Estimate per-neighbor template overhead: "\n[NEIGHBOR_X TAG]\nCard: \nDescription: "
+        fit_neighbors_fast.template_overhead = len(tokenizer.encode("\n[NEIGHBOR_1 [VERY_CLOSE]]\nCard: \nDescription: ", add_special_tokens=False))
+
+    static_tokens = fit_neighbors_fast.static_overhead
+    remaining_budget = max_length - static_tokens - 20 # Safety buffer
 
     valid_neighbors_text = []
     
     if remaining_budget > 0:
-        # Zip tags along with cards and descs
-        for i, (c, d, tag) in enumerate(zip(neighbor_cards, neighbor_descs, neighbor_tags), start=1):
-            n_text = neighbor_template.format(
-                i=i, 
-                tag=tag,
-                card=c.strip() if c else "UNKNOWN", 
-                desc=(d or "").strip()
-            )
+        for i, (nid, c, d, tag) in enumerate(zip(neighbor_ids, neighbor_cards, neighbor_descs, neighbor_tags), start=1):
+            # Fast lookup
+            c_len = card_cache.get_len(nid)
+            d_len = desc_cache.get_len(nid)
             
-            n_len = len(tokenizer.encode(n_text, add_special_tokens=False))
+            # Conservative estimate: Sum of parts >= Tokenized(Sum) usually
+            total_neighbor_cost = c_len + d_len + fit_neighbors_fast.template_overhead
             
-            if n_len <= remaining_budget:
+            if total_neighbor_cost <= remaining_budget:
+                n_text = (
+                    f"\n[NEIGHBOR_{i} {tag}]\n" 
+                    f"Card: {c.strip() if c else 'UNKNOWN'}\n"
+                    f"Description: {(d or '').strip()}"
+                )
                 valid_neighbors_text.append(n_text)
-                remaining_budget -= n_len
+                remaining_budget -= total_neighbor_cost
             else:
                 break
     
@@ -492,8 +284,165 @@ def fit_neighbors_efficiently(
     else:
         return f"{base_instruction}{footer}"
 
+
 # --------------------------------------------------------------------------------------
-# Build KNN dataset: prompts from KNN, references from ground truth
+# Rewards & Utils
+# --------------------------------------------------------------------------------------
+_WS_RE = re.compile(r"\s+")
+def _normalize_text(s: str) -> str:
+    if s is None: return ""
+    s = str(s).strip().lower()
+    s = _WS_RE.sub(" ", s)
+    return s
+
+def bleu_f1_sentence(pred: str, ref: str, tokenize: str = "13a") -> float:
+    pred_l = (pred or "").lower()
+    ref_l = (ref or "").lower()
+    bleu_p = sacrebleu.sentence_bleu(pred_l, [ref_l], tokenize=tokenize).score
+    bleu_r = sacrebleu.sentence_bleu(ref_l, [pred_l], tokenize=tokenize).score
+    denom = bleu_p + bleu_r
+    bleu_f1 = (2.0 * bleu_p * bleu_r / denom) if denom > 0 else 0.0
+    return float(bleu_f1 / 100.0)
+
+class CachedBERTScorer:
+    def __init__(self, device: str, batch_size: int = 32):
+        from bert_score import BERTScorer
+        self.scorer = BERTScorer(model_type="roberta-base", lang="en", device=device, batch_size=batch_size, idf=False, rescale_with_baseline=False)
+
+    @torch.no_grad()
+    def score_f1(self, preds: List[str], refs: List[str]) -> List[float]:
+        P, R, F1 = self.scorer.score(preds, refs)
+        return F1.detach().cpu().tolist()
+
+import re
+from collections import Counter
+
+# --------------------------------------------------------------------------------------
+# Advanced Reward Engineering: Dynamic + Constraint Based
+# --------------------------------------------------------------------------------------
+
+class ChemistryReward:
+    def __init__(self, device: str, bert_batch_size: int = 32):
+        self.bert_scorer = CachedBERTScorer(device=device, batch_size=bert_batch_size)
+        
+        # --- NEGATIVE CONSTRAINTS (The "Safety Net") ---
+        # These catch what BLEU/BERT miss: factual contradictions with the Input Card.
+        self.halogens_re = re.compile(r"fluor|chlor|brom|iod", re.IGNORECASE)
+        self.phospho_re = re.compile(r"phosph", re.IGNORECASE)
+        self.sulfur_re = re.compile(r"sulf|thio", re.IGNORECASE)
+        self.aromatic_re = re.compile(r"benz|phenyl|cycl|pyrid|furan|pyrrol|imida|indol", re.IGNORECASE)
+
+    def check_card_constraints(self, pred: str, prompt: str) -> float:
+        """
+        Parses the MolCard from the prompt.
+        If the Card says "0 Halogens", and the model generates "Chlorine", 
+        we apply a MASSIVE penalty. BLEU/BERT cannot detect this.
+        """
+        penalty = 0.0
+        pred_lower = pred.lower()
+
+        # Extract 'elements' and 'counts' from the prompt's MolCard
+        try:
+            query_part = prompt.split("[QUERY MOLECULE]")[-1]
+        except IndexError:
+            return 0.0 
+
+        # Regex helpers to find values in the MolCard string
+        def get_val(key):
+            m = re.search(rf"{key}:\s*(\d+)", query_part)
+            return int(m.group(1)) if m else None
+
+        # 1. No Halogens Allowed?
+        halogens = get_val("halogens_total")
+        if halogens == 0 and self.halogens_re.search(pred_lower):
+            penalty -= 1.5 # Heavy penalty
+
+        # 2. No Phosphorus? (Check elements line)
+        if "P=" not in query_part and self.phospho_re.search(pred_lower):
+            penalty -= 1.5
+
+        # 3. No Sulfur?
+        if "S=" not in query_part and self.sulfur_re.search(pred_lower):
+            penalty -= 1.5
+
+        # 4. No Aromatics?
+        aromatic = get_val("aromatic_atoms")
+        if aromatic == 0 and self.aromatic_re.search(pred_lower):
+            penalty -= 1.0
+
+        return penalty
+
+    def compute_length_penalty(self, pred: str, ref: str) -> float:
+        # Simple Gaussian window to prevent "short-caption" gaming
+        l_pred = len(pred.split())
+        l_ref = len(ref.split())
+        if l_ref == 0: return 0.0
+        
+        ratio = l_pred / l_ref
+        dev = abs(ratio - 1.0)
+        
+        # If length is within +/- 20% of reference, give bonus
+        if dev <= 0.2: return 0.5
+        # Else decay linearly
+        return max(-1.0, 0.5 - (dev * 2.0))
+
+    def get_rewards(self, prompts, completions, references):
+        # 1. Handle Completions (GRPO usually sends strings, PPO sends dicts)
+        preds = []
+        for c in completions:
+            if isinstance(c, str):
+                preds.append(c)
+            elif isinstance(c, list): 
+                # Handle [{"content": "..."}] format
+                preds.append(c[0]["content"])
+            else:
+                preds.append(str(c))
+                
+        refs = list(references)
+        
+        # --- FIX START: Unpack Prompts from Chat Format ---
+        prompt_texts = []
+        for p in prompts:
+            if isinstance(p, list):
+                # Input is [{"role": "user", "content": "..."}]
+                # We need the plain string 'content' to parse the MolCard
+                parts = [m.get("content", "") for m in p]
+                prompt_texts.append("\n".join(parts))
+            else:
+                # Input is already a string
+                prompt_texts.append(str(p))
+        # --- FIX END ---
+        
+        # 2. Semantic Foundation (BLEU + BERT)
+        bert_scores = self.bert_scorer.score_f1(preds, refs)
+        
+        rewards = []
+        # Zip over the extracted 'prompt_texts', not the raw 'prompts'
+        for prompt_text, pred, ref, bert in zip(prompt_texts, preds, refs, bert_scores):
+            bleu = bleu_f1_sentence(pred, ref)
+            
+            # Weighted Composite
+            total = (
+                0.5 * bert + 
+                0.4 * bleu + 
+                1.0 * self.check_card_constraints(pred, prompt_text) + 
+                0.2 * self.compute_length_penalty(pred, ref)
+            )
+            rewards.append(max(-3.0, min(3.0, float(total))))
+            
+        return rewards
+
+def make_reward_fn(device: str, bert_batch_size: int = 32):
+    engine = ChemistryReward(device=device, bert_batch_size=bert_batch_size)
+
+    # Note: Signature accepts 'prompts' now
+    def reward_fn(prompts, completions, reference, **kwargs):
+        return engine.get_rewards(prompts, completions, reference)
+
+    return reward_fn
+
+# --------------------------------------------------------------------------------------
+# Build KNN dataset
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def build_knn_prompt_dataset(
@@ -504,35 +453,31 @@ def build_knn_prompt_dataset(
     k: int,
     encode_batch_size: int,
     tokenizer_or_path: str,
+    thresholds: List[float],
     max_prompt_length: int = 1024,
     max_samples: Optional[int] = None,
     leave_one_out: bool = True,
 ) -> Dataset:
     
-    # --- Setup Tokenizer for Smart Truncation ---
     if isinstance(tokenizer_or_path, str):
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_path, 
-                                                    use_fast=True, 
-                                                    trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_path, use_fast=True, trust_remote_code=True)
     else:
         tokenizer = tokenizer_or_path
         
-    # Load train text embeddings (targets of GNN)
     train_id2emb = load_id2emb(train_emb_csv)
     train_ids = list(train_id2emb.keys())
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
 
-    # Load descriptions + mol_cards
     train_id2desc = load_descriptions_from_graphs(train_graphs)
     train_id2card = load_mol_cards_from_graphs(train_graphs)
 
-    # Encode training graphs with GNN
-    train_gnn_embs, train_ids_ordered = encode_graphs(
-        gnn_model, train_graphs, device=device, batch_size=encode_batch_size
-    )
+    # --- Prepare Cache ---
+    desc_cache = TokenLengthCache(tokenizer, train_id2desc, "Train Descriptions")
+    card_cache = TokenLengthCache(tokenizer, train_id2card, "Train Cards")
 
-    # Align indices for leave-one-out
+    train_gnn_embs, train_ids_ordered = encode_graphs(gnn_model, train_graphs, device=device, batch_size=encode_batch_size)
+
     id_to_trainemb_index = {tid: idx for idx, tid in enumerate(train_ids)}
 
     mask_self = None
@@ -545,20 +490,9 @@ def build_knn_prompt_dataset(
             if j is not None:
                 mask_self[i, j] = True
 
-    top_idx, top_sims = knn_topk(
-        query_embs_norm=train_gnn_embs,
-        train_embs_norm=train_embs,
-        k=k,
-        mask_self=mask_self,
-    )
-    
-    # --- Compute Dynamic Thresholds ---
-    print("Computing closeness thresholds from training distribution...")
-    thresholds = compute_similarity_thresholds(top_sims)
-    print(f"Thresholds (20%, 40%, 60%, 80%): {thresholds}")
-    
+    top_idx, top_sims = knn_topk(train_gnn_embs, train_embs, k=k, mask_self=mask_self)
+    # thresholds = compute_similarity_thresholds(top_sims) Now using passed thresholds
     top_idx = top_idx.cpu().tolist()
-    # Keep sims on CPU for fast iteration
     top_sims_list = top_sims.cpu().tolist()
 
     prompts: List[List[Dict[str, str]]] = []
@@ -571,66 +505,42 @@ def build_knn_prompt_dataset(
     for i in tqdm(range(n), desc="Building KNN Dataset"):
         qid = train_ids_ordered[i]
         
-        # Get neighbor data
         neighbor_ids = [train_ids[j] for j in top_idx[i]]
         neighbor_descs = [train_id2desc.get(nid, "") for nid in neighbor_ids]
         neighbor_cards = [train_id2card.get(nid, "") for nid in neighbor_ids]
-        
-        # --- Get Tags ---
         current_sims = top_sims_list[i]
         neighbor_tags = [get_closeness_tag(s, thresholds) for s in current_sims]
-
         query_card = train_id2card.get(qid, "")
 
-        smart_prompt_text = fit_neighbors_efficiently(
+        smart_prompt_text = fit_neighbors_fast(
             tokenizer=tokenizer,
             query_card=query_card,
+            neighbor_ids=neighbor_ids,
             neighbor_descs=neighbor_descs,
             neighbor_cards=neighbor_cards,
             neighbor_tags=neighbor_tags,
+            desc_cache=desc_cache,
+            card_cache=card_cache,
             max_length=max_prompt_length
         )
 
-        # Wrap back into chat format for compatibility
         prompts.append(prompt_as_chat(smart_prompt_text))
         references.append(train_id2desc.get(qid, ""))
-
-        if i == 0:
-            print(f"\n[DEBUG] Dataset Build - Sample 0 Prompt (Length: {len(tokenizer.encode(smart_prompt_text))} tokens)")
-            print("="*60)
-            print(smart_prompt_text)
-            print("="*60)
-            print(f"[DEBUG] Dataset Build - Sample 0 Reference")
-            print(train_id2desc.get(qid, ""))
-            print("="*60 + "\n")
 
     return Dataset.from_dict({"prompt": prompts, "reference": references})
 
 # --------------------------------------------------------------------------------------
-# Supervised Fine Tuning (SFT) on the KNN dataset
+# SFT
 # --------------------------------------------------------------------------------------
-
 def _render_prompt_for_sft(tokenizer, prompt_messages: List[Dict[str, str]]) -> str:
-    """
-    Convert a chat-style prompt (list of {role, content}) into a plain text string
-    for supervised fine-tuning. Uses the tokenizer chat template if available; otherwise
-    concatenates messages.
-    """
     if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
-        # No generation prompt here; SFT will append target separately
-        return tokenizer.apply_chat_template(
-            prompt_messages,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-    # Fallback: simple linearization
+        return tokenizer.apply_chat_template(prompt_messages, add_generation_prompt=True, tokenize=False)
     parts = []
     for m in prompt_messages:
         role = (m.get("role", "user") or "user").upper()
         parts.append(f"{role}: {m.get('content','')}")
     parts.append("ASSISTANT:")
     return "\n".join(parts)
-
 
 def sft_finetune_on_knn(
     base_model_name_or_path: str,
@@ -651,319 +561,75 @@ def sft_finetune_on_knn(
     fp16: bool = True,
     seed: int = 42,
 ) -> str:
-    """
-    Supervised fine-tuning (SFT) stage on the KNN prompt dataset.
-    Produces an intermediate model directory to be used as the starting policy for RL.
-    """
     os.makedirs(output_dir, exist_ok=True)
-
     config = AutoConfig.from_pretrained(base_model_name_or_path)
-    
-    # --- Robust dtype selection ---
-    if bf16:
-        torch_dtype = torch.bfloat16
-    elif fp16:
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            print("Upgrading float16 -> bfloat16 for stability.")
-            torch_dtype = torch.bfloat16
-        else:
-            torch_dtype = torch.float16
-    else:
-        torch_dtype = torch.float32
+    if bf16: dtype = torch.bfloat16
+    elif fp16: dtype = torch.float16 if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.bfloat16
+    else: dtype = torch.float32
 
-    device_map = "auto" if torch.cuda.is_available() else None
-
-    # Load Model
-    if config.is_encoder_decoder:
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            base_model_name_or_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_name_or_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-        )
-
-    # Enable Gradient Checkpointing manually to be safe
-    # This drastically reduces VRAM usage by not storing intermediate activations
+    model_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
+    model = model_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
     model.gradient_checkpointing_enable()
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, 
-                                              use_fast=True,
-                                              trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True)
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right" if config.is_encoder_decoder else "left"
 
     if use_lora:
-        lora_cfg = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM",
-            target_modules="all-linear",
-        )
+        lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
         model = get_peft_model(model, lora_cfg)
-        # Gradient checkpointing and LoRA compatibility fix
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
+        if hasattr(model, "enable_input_require_grads"): model.enable_input_require_grads()
         model.print_trainable_parameters()
 
-    # ----------------------------
-    # Tokenization
-    # ----------------------------
     def _tokenize_row(ex):
         prompt_msgs = ex["prompt"]
         ref = ex["reference"] or ""
-
+        prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
+        
         if config.is_encoder_decoder:
-            # 1. Tokenize Input (Encoder)
-            # T5 inputs do NOT need an EOS at the end, just padding.
-            prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
-            model_inputs = tokenizer(
-                prompt_text,
-                max_length=max_prompt_length,
-                truncation=True,
-            )
-
-            # 2. Tokenize Output (Decoder Labels)
-            # We use 'text_target' which typically adds EOS automatically.
-            # However, we can perform a safety check to ensure it's there.
-            labels = tokenizer(
-                text_target=ref, 
-                max_length=max_completion_length,
-                truncation=True,
-            )["input_ids"]
-
-            # --- SAFETY CHECK FOR T5 ---
-            # Ensure the last token is indeed the EOS token.
-            # T5 uses </s> (id=1) as EOS.
+            model_inputs = tokenizer(prompt_text, max_length=max_prompt_length, truncation=True)
+            labels = tokenizer(text_target=ref, max_length=max_completion_length, truncation=True)["input_ids"]
             if len(labels) > 0 and labels[-1] != tokenizer.eos_token_id:
-                # If truncation cut it off, or tokenizer didn't add it:
-                if len(labels) >= max_completion_length:
-                    # Make room for EOS if we are at max length
-                    labels[-1] = tokenizer.eos_token_id 
-                else:
-                    # Append EOS if missing
-                    labels.append(tokenizer.eos_token_id)
-            
+                if len(labels) >= max_completion_length: labels[-1] = tokenizer.eos_token_id 
+                else: labels.append(tokenizer.eos_token_id)
             model_inputs["labels"] = labels
             return model_inputs
 
-        # CausalLM
-        prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
-        
-        # 1. Construct Full Text
-        # We append tokenizer.eos_token to ensure the model learns to STOP.
         full_text = prompt_text + " " + ref + tokenizer.eos_token
-
-        # 2. Tokenize the full text with special tokens (BOS is usually added here)
-        full = tokenizer(
-            full_text,
-            max_length=max_prompt_length + max_completion_length,
-            truncation=True,
-            add_special_tokens=True, 
-        )
-        
+        full = tokenizer(full_text, max_length=max_prompt_length + max_completion_length, truncation=True, add_special_tokens=True)
         input_ids = full["input_ids"]
         labels = input_ids.copy()
-
-        # 3. Mask the Prompt so we don't train on it
-        # We need to find the length of the prompt tokens to mask them.
-        prompt_ids = tokenizer(
-            prompt_text,
-            max_length=max_prompt_length,
-            truncation=True,
-            add_special_tokens=False, # Important: Don't add BOS here or length calc will be off
-        )["input_ids"]
-
-        # Calculate exact length of prompt in the full encoding
-        # (This can be tricky if BOS is added to full but not prompt_ids, 
-        #  so usually we just iterate to find the overlap or len)
-        prompt_len = len(prompt_ids) 
-        
-        # Safety adjustment: sometimes tokenizer merges tokens at boundaries.
-        # A simpler way often used in TRL is simply:
-        if tokenizer.bos_token_id and input_ids[0] == tokenizer.bos_token_id:
-            # If full input has BOS, prompt_ids likely didn't count it.
-             prompt_len += 1
-
-        # Apply the mask (-100)
-        for i in range(min(prompt_len, len(labels))):
-            labels[i] = -100
-
+        prompt_ids = tokenizer(prompt_text, max_length=max_prompt_length, truncation=True, add_special_tokens=False)["input_ids"]
+        prompt_len = len(prompt_ids)
+        if tokenizer.bos_token_id and input_ids[0] == tokenizer.bos_token_id: prompt_len += 1
+        for i in range(min(prompt_len, len(labels))): labels[i] = -100
         full["labels"] = labels
         return full
 
-    tokenized = train_dataset.map(
-        _tokenize_row,
-        remove_columns=train_dataset.column_names,
-    )
+    tokenized = train_dataset.map(_tokenize_row, remove_columns=train_dataset.column_names)
 
-    # ----------------------------
-    # Collator
-    # ----------------------------
     if config.is_encoder_decoder:
-        data_collator = DataCollatorForSeq2Seq(
-            tokenizer=tokenizer,
-            model=model,
-            padding=True,
-            label_pad_token_id=-100,
-        )
+        data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True, label_pad_token_id=-100)
     else:
-        base_collator = DataCollatorWithPadding(
-            tokenizer=tokenizer,
-            padding=True,
-            return_tensors="pt",
-        )
-
+        base_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True, return_tensors="pt")
         def _causal_collate(features):
-            first = features[0]
-            labels = None
-            if "labels" in first:
-                labels = [f.pop("labels") for f in features]
-            
+            labels = [f.pop("labels") for f in features] if "labels" in features[0] else None
             batch = base_collator(features)
-
             if labels is not None:
                 batch_len = batch["input_ids"].shape[1]
                 padded_labels = []
                 for l in labels:
                     pad_len = batch_len - len(l)
-                    if tokenizer.padding_side == "left":
-                        padded_labels.append([-100] * pad_len + l)
-                    else:
-                        padded_labels.append(l + [-100] * pad_len)
+                    padded_labels.append([-100] * pad_len + l) # Left padding
                 batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
             return batch
-
         data_collator = _causal_collate
 
-    # ----------------------------
-    # Train
-    # ----------------------------
-    args = TrainingArguments(
-        output_dir=output_dir,
-        max_steps=num_train_steps,
-        per_device_train_batch_size=per_device_train_batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=learning_rate,
-        logging_steps=10,
-        save_steps=200,
-        save_total_limit=2,
-        bf16=bf16,
-        fp16=(fp16 and not bf16),
-        report_to=[],
-        seed=seed,
-        remove_unused_columns=False,
-        # --- MEMORY OPTIMIZATION ---
-        gradient_checkpointing=True, # <--- CRITICAL FIX
-        gradient_checkpointing_kwargs={"use_reentrant": False}, # Safer for LoRA
-    )
+    args = TrainingArguments(output_dir=output_dir, max_steps=num_train_steps, per_device_train_batch_size=per_device_train_batch_size, gradient_accumulation_steps=gradient_accumulation_steps, learning_rate=learning_rate, logging_steps=int(0.1*num_train_steps), save_steps=200, save_total_limit=2, bf16=bf16, fp16=(fp16 and not bf16), report_to=[], seed=seed, remove_unused_columns=False, gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})
     
-    class DebugGenCallback(TrainerCallback):
-        def __init__(self, tokenizer, dataset, device, is_encoder_decoder):
-            self.tokenizer = tokenizer
-            self.sample = dataset[0]
-            self.device = device
-            self.is_encoder_decoder = is_encoder_decoder
-            
-        def on_log(self, args, state, control, model=None, **kwargs):
-            was_training = model.training
-            model.eval()
-            
-            # --- FIX STARTS HERE ---
-            # 1. Get the full sequence
-            full_input_ids = torch.tensor([self.sample["input_ids"]]).to(self.device)
-            
-            # 2. Determine where the prompt ends
-            if self.is_encoder_decoder:
-                # For T5/Seq2Seq, input_ids is just the prompt. No slicing needed.
-                input_ids = full_input_ids
-            else:
-                # For Decoder-only (Qwen, Llama), input_ids is Prompt + Answer.
-                # We use the labels (masked with -100) to find the split point.
-                labels = torch.tensor([self.sample["labels"]]).to(self.device)
-                
-                # Find the last index where label is -100 (which indicates prompt tokens)
-                # We want to slice input_ids up to that point.
-                # Note: labels are -100 for the prompt, and valid IDs for the answer.
-                mask = (labels == -100)
-                
-                # If there are no -100s, it might be all answer (unlikely) or no masking.
-                if mask.any():
-                    # Get the length of the prompt (number of -100s)
-                    prompt_len = mask.sum().item()
-                    input_ids = full_input_ids[:, :prompt_len]
-                else:
-                    # Fallback
-                    input_ids = full_input_ids
-
-            attention_mask = torch.ones_like(input_ids)
-            # --- FIX ENDS HERE ---
-
-            # Generate
-            with torch.no_grad():
-                gen_out = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=192,
-                    do_sample=True, 
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    use_cache=True
-                )
-            
-            # --- CONDITIONAL SLICING ---
-            if self.is_encoder_decoder:
-                generated_tokens = gen_out
-            else:
-                # CausalLM returns Input + New Tokens -> slice off input
-                input_len = input_ids.shape[1]
-                generated_tokens = gen_out[:, input_len:]
-            
-            gen_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-            
-            # Decode Reference (filter out -100)
-            ref_ids = [t for t in self.sample.get("labels", []) if t != -100]
-            ref_text = self.tokenizer.decode(ref_ids, skip_special_tokens=True)
-            
-            print(f"\n[Step {state.global_step} DEBUG]")
-            print(f"  Ref: {ref_text}")
-            print(f"  Gen: {gen_text}")
-            print("-" * 30)
-            
-            if was_training:
-                model.train()
-                # Re-enable GC
-                if hasattr(model, "gradient_checkpointing_enable"):
-                    model.gradient_checkpointing_enable()
-
-    debug_callback = DebugGenCallback(
-        tokenizer, 
-        tokenized, 
-        model.device, 
-        is_encoder_decoder=config.is_encoder_decoder
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=tokenized,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-        callbacks=[debug_callback]
-    )
+    trainer = Trainer(model=model, args=args, train_dataset=tokenized, data_collator=data_collator, tokenizer=tokenizer)
     trainer.train()
-    
-    if use_lora:
-        model = model.merge_and_unload()
-
+    if use_lora: model = model.merge_and_unload()
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     return output_dir
@@ -971,7 +637,7 @@ def sft_finetune_on_knn(
 # --------------------------------------------------------------------------------------
 # RL fine-tuning
 # --------------------------------------------------------------------------------------
-def finetune_base_model(
+def rl_finetune_on_knn(
     base_model_name_or_path: str,
     output_dir: str,
     train_dataset: Dataset,
@@ -986,267 +652,90 @@ def finetune_base_model(
     num_train_steps: int = 500,
     per_device_train_batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
-    num_generations: int = 4,  # GRPO only
+    num_generations: int = 4,
     learning_rate: float = 5e-6,
     bf16: bool = False,
     fp16: bool = True,
     seed: int = 42,
     bert_reward_batch_size: int = 16,
 ) -> str:
-    """
-    Fine-tune with GRPO or PPO (user-selectable).
-
-    Notes:
-      - GRPO path expects TRL GRPOTrainer behavior.
-      - PPO path uses TRL PPOTrainer and requires a value head (TRL wrapper).
-      - For PPO, we linearize chat-style prompts to plain text (model-agnostic).
-    """
     os.makedirs(output_dir, exist_ok=True)
-
     rl_algo = (rl_algo or "grpo").strip().lower()
-    if rl_algo not in {"grpo", "ppo"}:
-        raise ValueError(f"Unsupported rl_algo={rl_algo}. Expected 'grpo' or 'ppo'.")
-
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, 
-                                                use_fast=True,
-                                                trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True)
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-
     config = AutoConfig.from_pretrained(base_model_name_or_path)
 
-    if bf16:
-        torch_dtype = torch.bfloat16
-    elif fp16:
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            print("Upgrading float16 -> bfloat16 for stability.")
-            torch_dtype = torch.bfloat16
-        else:
-            torch_dtype = torch.float16
-    else:
-        torch_dtype = torch.float32
+    if bf16: dtype = torch.bfloat16
+    elif fp16: dtype = torch.float16 if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.bfloat16
+    else: dtype = torch.float32
         
-    device_map = "auto" if torch.cuda.is_available() else None
-
-    # ----------------------------
-    # Load model(s)
-    # ----------------------------
     if rl_algo == "ppo":
-        if config.is_encoder_decoder:
-            base = AutoModelForSeq2SeqLM.from_pretrained(
-                base_model_name_or_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-            )
-            ref_base = AutoModelForSeq2SeqLM.from_pretrained(
-                base_model_name_or_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-            )
-
-            # Apply LoRA BEFORE wrapping with value head
-            if use_lora:
-                lora_cfg = LoraConfig(
-                    r=lora_r,
-                    lora_alpha=lora_alpha,
-                    lora_dropout=lora_dropout,
-                    bias="none",
-                    task_type="SEQ_2_SEQ_LM",
-                    target_modules="all-linear",
-                )
-                base = get_peft_model(base, lora_cfg)
-                base.print_trainable_parameters()
-
-            model = AutoModelForSeq2SeqLMWithValueHead(base)
-            ref_model = AutoModelForSeq2SeqLMWithValueHead(ref_base)
-
-        else:
-            base = AutoModelForCausalLM.from_pretrained(
-                base_model_name_or_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-            )
-            ref_base = AutoModelForCausalLM.from_pretrained(
-                base_model_name_or_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-            )
-
-            if use_lora:
-                lora_cfg = LoraConfig(
-                    r=lora_r,
-                    lora_alpha=lora_alpha,
-                    lora_dropout=lora_dropout,
-                    bias="none",
-                    task_type="CAUSAL_LM",
-                    target_modules="all-linear",
-                )
-                base = get_peft_model(base, lora_cfg)
-                base.print_trainable_parameters()
-
-            model = AutoModelForCausalLMWithValueHead(base)
-            ref_model = AutoModelForCausalLMWithValueHead(ref_base)
+        model_cls = AutoModelForSeq2SeqLMWithValueHead if config.is_encoder_decoder else AutoModelForCausalLMWithValueHead
+        base_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
+        base = base_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
+        ref_base = base_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
+        if use_lora:
+            lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
+            base = get_peft_model(base, lora_cfg)
+        model = model_cls(base)
+        ref_model = model_cls(ref_base)
     else:
-        # GRPO (no value head)
-        if config.is_encoder_decoder:
-            model = AutoModelForSeq2SeqLM.from_pretrained(
-                base_model_name_or_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-            )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model_name_or_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-            )
-
-    # ----------------------------
-    # Optional LoRA
-    # ----------------------------
-    if use_lora:
-        # For PPO, LoRA was already applied to `base` BEFORE wrapping with value head.
-        # Applying LoRA again to the TRL ValueHead wrapper breaks PEFT expectations.
-        if rl_algo == "grpo":
-            lora_cfg = LoraConfig(
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                bias="none",
-                task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM",
-                target_modules="all-linear",
-            )
+        model_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
+        model = model_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
+        if use_lora:
+            lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
             model = get_peft_model(model, lora_cfg)
-            model.print_trainable_parameters()
 
-    # ----------------------------
-    # Reward function (reuse existing)
-    # ----------------------------
     reward_fn = make_reward_fn(device=device, bert_batch_size=bert_reward_batch_size)
 
-    # ----------------------------
-    # Train
-    # ----------------------------
     if rl_algo == "grpo":
-        training_args = GRPOConfig(
-            output_dir=output_dir,
-            learning_rate=learning_rate,
-            max_steps=num_train_steps,
-            per_device_train_batch_size=per_device_train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            num_generations=num_generations,
-            max_prompt_length=max_prompt_length,
-            max_completion_length=max_completion_length,
-            bf16=bf16,
-            fp16=fp16 if not bf16 else False,
-            logging_steps=10,
-            save_steps=100,
-            seed=seed,
-            report_to=[],
-        )
-
-        trainer = GRPOTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            reward_funcs=reward_fn,
-        )
-
+        training_args = GRPOConfig(output_dir=output_dir, learning_rate=learning_rate, max_steps=num_train_steps, 
+                        per_device_train_batch_size=per_device_train_batch_size, gradient_accumulation_steps=gradient_accumulation_steps, 
+                        num_generations=num_generations, max_prompt_length=max_prompt_length, max_completion_length=max_completion_length, 
+                        bf16=bf16, fp16=fp16 if not bf16 else False, logging_steps=10, save_steps=100, seed=seed, report_to=[])
+        trainer = GRPOTrainer(model=model, args=training_args, train_dataset=train_dataset, reward_funcs=reward_fn)
         trainer.train()
         trainer.save_model(output_dir)
         tokenizer.save_pretrained(output_dir)
         return output_dir
-
-    # ----------------------------
-    # PPO path
-    # ----------------------------
+    
+    # PPO Path
     def _prompt_to_text(p):
-        if isinstance(p, str):
-            return p
+        if isinstance(p, str): return p
         if isinstance(p, list):
-            # list[{"role","content"}] -> plain text
             parts = []
             for m in p:
                 role = (m.get("role", "user") or "user").upper()
-                content = m.get("content", "")
-                parts.append(f"{role}: {content}")
+                parts.append(f"{role}: {m.get('content','')}")
             parts.append("ASSISTANT:")
             return "\n".join(parts)
         return str(p)
 
-    # Ensure PPO sees plain text prompts
-    if "prompt" in train_dataset.column_names:
-        train_dataset = train_dataset.map(lambda ex: {"prompt": _prompt_to_text(ex["prompt"])})
-    else:
-        raise ValueError("PPO requires a 'prompt' column in train_dataset.")
-
-    if "reference" not in train_dataset.column_names:
-        raise ValueError("PPO path expects a 'reference' column for reward computation.")
-
-    ppo_cfg = PPOConfig(
-        batch_size=per_device_train_batch_size,
-        mini_batch_size=max(1, per_device_train_batch_size // max(1, gradient_accumulation_steps)),
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=learning_rate,
-        seed=seed,
-    )
+    train_dataset = train_dataset.map(lambda ex: {"prompt": _prompt_to_text(ex["prompt"])})
+    ppo_cfg = PPOConfig(batch_size=per_device_train_batch_size, mini_batch_size=max(1, per_device_train_batch_size // max(1, gradient_accumulation_steps)), gradient_accumulation_steps=gradient_accumulation_steps, learning_rate=learning_rate, seed=seed)
 
     def _collate(batch):
         prompts = [b["prompt"] for b in batch]
         refs = [b["reference"] for b in batch]
-        enc = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_prompt_length,
-        )
-        enc["reference_text"] = refs  # keep raw strings for reward
+        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_length)
+        enc["reference_text"] = refs 
         return enc
 
-    trainer = PPOTrainer(
-        config=ppo_cfg,
-        model=model,
-        ref_model=ref_model,
-        tokenizer=tokenizer,
-        dataset=train_dataset,
-        data_collator=_collate,
-    )
-
-    gen_kwargs = dict(
-        max_new_tokens=max_completion_length,
-        do_sample=True,
-        top_p=0.9,
-        temperature=0.8,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    trainer = PPOTrainer(config=ppo_cfg, model=model, ref_model=ref_model, tokenizer=tokenizer, dataset=train_dataset, data_collator=_collate)
+    gen_kwargs = dict(max_new_tokens=max_completion_length, do_sample=True, top_p=0.9, temperature=0.8, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
 
     step = 0
     for batch in trainer.dataloader:
-        if step >= num_train_steps:
-            break
-
+        if step >= num_train_steps: break
         query_tensors = batch["input_ids"].to(trainer.accelerator.device)
         attention_mask = batch.get("attention_mask", None)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(trainer.accelerator.device)
-
-        response_tensors = trainer.generate(
-            query_tensors,
-            attention_mask=attention_mask,
-            **gen_kwargs,
-        )
-
+        if attention_mask is not None: attention_mask = attention_mask.to(trainer.accelerator.device)
+        response_tensors = trainer.generate(query_tensors, attention_mask=attention_mask, **gen_kwargs)
         responses_dec = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
-        refs = batch["reference_text"]
-
-        # Adapt to existing reward_fn signature: completions is list[list[{role,content}]]
         completions = [[{"role": "assistant", "content": r}] for r in responses_dec]
-        reward_vals = reward_fn(completions=completions, reference=refs)
+        reward_vals = reward_fn(completions=completions, reference=batch["reference_text"])
         rewards = [torch.tensor(r, device=trainer.accelerator.device) for r in reward_vals]
-
         trainer.step(query_tensors, response_tensors, rewards)
         step += 1
 
@@ -1254,13 +743,15 @@ def finetune_base_model(
     tokenizer.save_pretrained(output_dir)
     return output_dir
 
+# --------------------------------------------------------------------------------------
+# Generation
+# --------------------------------------------------------------------------------------
+# Enable faster matrix multiplications on Ampere+ GPUs (RTX 30xx, A100, etc.)
+torch.backends.cuda.matmul.allow_tf32 = True
 
-# --------------------------------------------------------------------------------------
-# Generation on validation/test: retrieval -> prompt -> batch generate
-# --------------------------------------------------------------------------------------
 @torch.no_grad()
 def generate_desc(
-    gnn_model: MolGNN,
+    gnn_model,
     llm_dir_or_name: str,
     train_graphs: str,
     query_graphs: str,
@@ -1268,9 +759,11 @@ def generate_desc(
     device: str,
     k: int,
     out_csv: str,
+    thresholds: List[float],
     encode_batch_size: int = 64,
     gen_batch_size: int = 8,
     max_new_tokens: int = 192,
+    max_length: int = 4096,
     temperature: float = 0.7,
     top_p: float = 0.9,
     do_sample: bool = True,
@@ -1278,51 +771,58 @@ def generate_desc(
     ) -> pd.DataFrame:
     
     # ----------------------------
-    # 1. Load Tokenizer & LLM FIRST (Needed for smart prompting)
+    # 1. Setup Model (Optimization: TF32 & BF16)
     # ----------------------------
     print(f"Loading LLM and Tokenizer from {llm_dir_or_name}...")
-
-    # --- DYNAMIC CONTEXT LENGTH ---
-    model_max_length = get_safe_context_length(llm_dir_or_name, cap=4096)
-    print(f"Using max prompt length: {model_max_length}")
+    
+    # Auto-detect context length (reusing helper from your script)
+    try:
+        model_max_length = get_safe_context_length(llm_dir_or_name, cap=max_length)
+    except NameError:
+        model_max_length = 2048
 
     tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    
     config = AutoConfig.from_pretrained(llm_dir_or_name)
     is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
+    
+    # T5 (Seq2Seq) uses Right Padding for encoder; GPT (Causal) uses Left Padding
     tokenizer.padding_side = "right" if is_seq2seq else "left"
 
-    # Determine Model Max Length
-    model_max_length = getattr(config, "max_position_embeddings", 1024)
-    if model_max_length > 4096: 
-        model_max_length = 2048 
-    
-    # --- bfloat16 for Stability ---
+    # Dtype Selection
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        torch_dtype = torch.bfloat16
-        print("Using bfloat16.")
+        dtype = torch.bfloat16
+        print("Using bfloat16 for generation.")
     elif torch.cuda.is_available():
-        torch_dtype = torch.float16
-        print("Using float16 (Warning: Potential T5 instability).")
+        dtype = torch.float16
+        print("Using float16 for generation.")
     else:
-        torch_dtype = torch.float32
+        dtype = torch.float32
 
-    device_map = "auto" if torch.cuda.is_available() else None
-
-    if is_seq2seq:
-        llm = AutoModelForSeq2SeqLM.from_pretrained(llm_dir_or_name, torch_dtype=torch_dtype, device_map=device_map)
-    else:
-        llm = AutoModelForCausalLM.from_pretrained(llm_dir_or_name, torch_dtype=torch_dtype, device_map=device_map)
+    model_cls = AutoModelForSeq2SeqLM if is_seq2seq else AutoModelForCausalLM
+    llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto")
     llm.eval()
+    
+    # Compile model for ~20% speedup on modern PyTorch (Linux only, usually)
+    if hasattr(torch, "compile") and os.name != "nt":
+        try:
+            print("Compiling model with torch.compile...")
+            llm = torch.compile(llm)
+        except Exception:
+            print("Could not compile model (skipping optimization).")
 
     # ----------------------------
-    # 2. Retrieval
+    # 2. Retrieval Phase (Standard)
     # ----------------------------
+    # (Assuming helper functions exist in your scope)
     train_id2desc = load_descriptions_from_graphs(train_graphs)
     train_id2card = load_mol_cards_from_graphs(train_graphs)
     query_id2card = load_mol_cards_from_graphs(query_graphs)
+
+    # Initialize Caches for Speed (from previous optimization)
+    desc_cache = TokenLengthCache(tokenizer, train_id2desc, "Train Descriptions")
+    card_cache = TokenLengthCache(tokenizer, train_id2card, "Train Cards")
 
     train_id2emb = load_id2emb(train_emb_csv)
     train_ids = list(train_id2emb.keys())
@@ -1334,310 +834,309 @@ def generate_desc(
 
     print(f"Retrieving top {k} neighbors..")
     top_idx, top_sims = knn_topk(query_embs, train_embs, k=k)
-    
-    # --- Compute Thresholds for this split ---
-    thresholds = compute_similarity_thresholds(top_sims)
-    
+    # thresholds = compute_similarity_thresholds(top_sims) Now using passed thresholds
     top_idx = top_idx.cpu().tolist()
     top_sims = top_sims.cpu().tolist()
 
-    top_idx = top_idx.cpu().tolist()
-    top_sims = top_sims.cpu().tolist()
+    # ----------------------------
+    # 3. Prompt Construction
+    # ----------------------------
+    # We store tuples: (length, prompt_text, qid, nn_ids, sims)
+    data_buffer = []
 
-    prompts_text: List[str] = []
-    nn_ids_all: List[List[str]] = []
-    sims_all: List[List[float]] = []
-
-    for i in tqdm(list(range(len(query_ids))), desc="Building smart prompts.."):
+    print("Building prompts...")
+    for i in tqdm(range(len(query_ids)), desc="Constructing"):
         qid = query_ids[i]
         nn_ids = [train_ids[j] for j in top_idx[i]]
         nn_descs = [train_id2desc.get(nid, "") for nid in nn_ids]
         nn_cards = [train_id2card.get(nid, "") for nid in nn_ids]
         query_card = query_id2card.get(qid, "")
-
-        # -- Use Smart Truncation ---
+        
         current_sims = top_sims[i]
         neighbor_tags = [get_closeness_tag(s, thresholds) for s in current_sims]
-        
-        smart_prompt = fit_neighbors_efficiently(
+
+        # Use the optimized prompt builder
+        smart_prompt = fit_neighbors_fast(
             tokenizer=tokenizer,
             query_card=query_card,
+            neighbor_ids=nn_ids,
             neighbor_descs=nn_descs,
             neighbor_cards=nn_cards,
             neighbor_tags=neighbor_tags,
+            desc_cache=desc_cache,
+            card_cache=card_cache,
             max_length=model_max_length
         )
-        prompts_text.append(smart_prompt)
-        nn_ids_all.append(nn_ids)
-        sims_all.append([float(s) for s in top_sims[i]])
+        
+        # Estimate length for sorting (just string length is a good enough proxy for speed)
+        data_buffer.append({
+            "len": len(smart_prompt), 
+            "prompt": smart_prompt,
+            "id": qid,
+            "nn_ids": nn_ids,
+            "sims": current_sims
+        })
 
     # ----------------------------
-    # 3. Batch Generation
+    # 4. OPTIMIZATION: Sort by Length
     # ----------------------------
-    decoder_start_token_id = None
-    if is_seq2seq:
-        if hasattr(llm.config, "decoder_start_token_id") and llm.config.decoder_start_token_id is not None:
-            decoder_start_token_id = llm.config.decoder_start_token_id
-        elif hasattr(tokenizer, "pad_token_id"):
-            decoder_start_token_id = tokenizer.pad_token_id
+    # Sorting groups short prompts with short, long with long. 
+    # This drastically reduces padding overhead in batches.
+    print("Sorting data by prompt length to optimize batch padding...")
+    data_buffer.sort(key=lambda x: x["len"])
+    
+    sorted_prompts = [x["prompt"] for x in data_buffer]
+    sorted_ids = [x["id"] for x in data_buffer]
+    sorted_nn_ids = [x["nn_ids"] for x in data_buffer]
+    sorted_sims = [x["sims"] for x in data_buffer]
 
+    # ----------------------------
+    # 5. Batch Generation
+    # ----------------------------
+    print(f"Generating with Batch Size {gen_batch_size} (Greedy/Sampling, No Beams)...")
+    
     gen_cfg = GenerationConfig(
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,        # random sampling 
-        num_beams=4,            # Enable Beam Search
-        repetition_penalty=1.25, # Penalize the "gibberish loops"
+        do_sample=do_sample,       
+        num_beams=1,  # <--- CRITICAL: Disable Beam Search for speed
         temperature=temperature,
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        decoder_start_token_id=decoder_start_token_id
+        decoder_start_token_id=llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id
     )
 
     use_chat_template = bool(hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None))
-    generations: List[str] = []
+    generations = []
 
-    for start in tqdm(list(range(0, len(prompts_text), gen_batch_size)), desc="Generating.."):
-        batch_prompts = prompts_text[start : start + gen_batch_size]
+    # Iterate through the SORTED list
+    for start in tqdm(range(0, len(sorted_prompts), gen_batch_size), desc="Generating"):
+        batch_prompts = sorted_prompts[start : start + gen_batch_size]
         
-        # Failsafe: Left truncation if somehow we still exceed limits
+        # Ensure left-truncation if we somehow exceed limits (unlikely with sorting + pre-check)
         tokenizer.truncation_side = 'left' 
 
         if use_chat_template:
             batch_msgs = [prompt_as_chat(p) for p in batch_prompts]
-            input_ids = tokenizer.apply_chat_template(
-                batch_msgs,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
+            inputs = tokenizer.apply_chat_template(
+                batch_msgs, 
+                add_generation_prompt=True, 
+                tokenize=True, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True, 
                 max_length=model_max_length
-            ).to(llm.device)
+            )
+            input_ids = inputs.to(llm.device)
         else:
-            enc = tokenizer(
-                batch_prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
+            inputs = tokenizer(
+                batch_prompts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True, 
                 max_length=model_max_length
-            ).to(llm.device)
-            input_ids = enc["input_ids"]
+            )
+            input_ids = inputs["input_ids"].to(llm.device)
 
-        # --- Explicit Attention Mask ---
         attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
-        outputs = llm.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            generation_config=gen_cfg,
-        )
+        with torch.no_grad():
+            outputs = llm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=gen_cfg,
+                use_cache=True 
+            )
 
         if is_seq2seq:
             texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         else:
+            # For CausalLM, slice off input
             gen_only = outputs[:, input_ids.shape[1] :]
             texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
         
-        batch_gens = [t.strip() for t in texts]
-        generations.extend(batch_gens)
+        generations.extend([t.strip() for t in texts])
 
-        if start == 0:
-            print("\n" + "="*60)
-            print(" [DEBUG] Sanity Check: Generation Batch 0, Item 0")
-            print("="*60)
-            print(f"--- Prompt Sent to Model (Truncated) ---\n{batch_prompts[0][-500:]}") 
-            print("-" * 30)
-            # This is the actual model output you were looking for:
-            print(f"--- ACTUAL MODEL OUTPUT ---\n{batch_gens[0]}")
-            print("="*60 + "\n")
-
-    # Write CSV
+    # ----------------------------
+    # 6. Re-align & Save
+    # ----------------------------
+    # The generations are currently in "Length-Sorted" order. 
+    # We can save them as is, just keeping the IDs aligned.
+    
     rows = []
-    for i, qid in tqdm(enumerate(query_ids), desc='Creating the DataFrame..'):
-        row = { "ID": qid, "Prompt": prompts_text[i], "generated_description": generations[i] }
-        for j in range(len(nn_ids_all[i])):
-            row[f"NN{j+1}"] = nn_ids_all[i][j]
-            row[f"SIM{j+1}"] = sims_all[i][j]
+    for i in range(len(sorted_ids)):
+        row = { 
+            "ID": sorted_ids[i], 
+            "Prompt": sorted_prompts[i], 
+            "generated_description": generations[i] 
+        }
+        for j in range(len(sorted_nn_ids[i])):
+            row[f"NN{j+1}"] = sorted_nn_ids[i][j]
+            row[f"SIM{j+1}"] = sorted_sims[i][j]
         rows.append(row)
 
     df = pd.DataFrame(rows)
+    # Optional: Sort back by ID if you prefer original order
+    # df = df.sort_values(by="ID") 
+    
     os.makedirs(str(Path(out_csv).parent), exist_ok=True)
     df.to_csv(out_csv, index=False)
-    print(f"Saved generations to: {out_csv}")
-    
+    print(f"Saved full dataframe generations to: {out_csv}")
+
+    eval_df = df[["ID", "generated_description"]].rename(columns={"generated_description": "description"})
+    submit_out_csv = out_csv.replace(".csv", "_submit.csv")
+    eval_df.to_csv(submit_out_csv, index=False)
+    print(f"Saved submission generations to: {submit_out_csv}")
+
     if evaluate and _EVAL_AVAILABLE:
+        # Load descriptions for evaluation
+        print("Running evaluation metrics...")
         query_id2desc = load_descriptions_from_graphs(query_graphs)
         metrics_path = str(Path(out_csv).with_suffix(".metrics.json"))
-        eval_df = df[["ID", "generated_description"]].rename(columns={"generated_description": "description"})
-        evaluate_retrieval_text_metrics(results_df=eval_df, test_id2desc=query_id2desc, device=device, save_path=metrics_path)
+
+        evaluate_retrieval_text_metrics(
+            results_df=eval_df, 
+            test_id2desc=query_id2desc, 
+            device=device, 
+            save_path=metrics_path
+        )
 
     return df
-
 
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
 def main():
     parser = ArgumentParser()
-    parser.add_argument("-f_data", default="data_baseline/data", type=str, help="Folder containing *graphs.pkl files")
-    parser.add_argument("-f", default="data_baseline/data", type=str, help="Folder containing embeddings/model checkpoint")
+    parser.add_argument("-f_data", default="data_baseline/data", type=str)
+    parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("--k", default=3, type=int)
     parser.add_argument("--encode_batch_size", default=128, type=int)
-    parser.add_argument("--max_train_samples", default=None, type=int, help="Limit RL dataset size for quick prototyping")
-    
-    # LLM
-    parser.add_argument(
-        "--base_llm",
-        default="QizhiPei/biot5-plus-base",
-        type=str,
-        help="HF model name/path (<=1B recommended).",
-    )
-    parser.add_argument("--max_prompt_length", default=None, type=int, help="Override auto-detected context length")
-    parser.add_argument("--out_llm_dir", default="knn_llm", type=str, help="Where to save the fine-tuned model")
+    parser.add_argument("--max_train_samples", default=None, type=int)
+    parser.add_argument("--base_llm", default="QizhiPei/biot5-plus-base", type=str)
+    parser.add_argument("--max_prompt_length", default=None, type=int)
+    parser.add_argument("--out_llm_dir", default="knn_llm", type=str)
 
-    # Actions
-    parser.add_argument("--do_finetune", action="store_true", help="Run GRPO fine-tuning")
-    parser.add_argument("--do_generate", action="store_true", help="Run generation on a split")
-    parser.add_argument("--do_sft", action="store_true", help="Run SFT on the KNN dataset before RL")
-    
-    # SFT params
+    parser.add_argument("--do_finetune", action="store_true")
+    parser.add_argument("--do_generate", action="store_true")
+    parser.add_argument("--do_sft", action="store_true")
+
     parser.add_argument("--sft_steps", default=800, type=int)
     parser.add_argument("--sft_lr", default=2e-5, type=float)
 
-    # Generation split
     parser.add_argument("--split", default="test", choices=["validation", "val", "test"])
     parser.add_argument("--gen_batch_size", default=4, type=int)
     parser.add_argument("--max_new_tokens", default=256, type=int)
 
-    parser.add_argument(
-        "--rl_algo",
-        default=None,
-        choices=["grpo", "ppo"],
-        help="RL algorithm: grpo or ppo (seq2seq-friendly).",
-    )
-    # RL params (prototype defaults)
-    parser.add_argument("--steps", default=300, type=int)
-    parser.add_argument("--lr", default=1e-5, type=float)
+    parser.add_argument("--rl_algo", default=None, choices=["grpo", "ppo"])
+    parser.add_argument("--rl_steps", default=300, type=int)
+    parser.add_argument("--lr", default=0.5e-6, type=float)
     parser.add_argument("--per_device_bs", default=2, type=int)
     parser.add_argument("--grad_accum", default=4, type=int)
     parser.add_argument("--num_generations", default=4, type=int)
-    parser.add_argument("--use_lora", action="store_true", help="Use LoRA adapters (recommended)")
-    parser.add_argument("--no_lora", action="store_true", help="Disable LoRA")
-
-    # Reward speed
-    parser.add_argument("--bert_reward_bs", default=16, type=int, help="BERTScore batch size inside reward")
-
+    parser.add_argument("--use_lora", action="store_true")
+    parser.add_argument("--no_lora", action="store_true")
+    parser.add_argument("--bert_reward_bs", default=16, type=int)
     args = parser.parse_args()
 
-    # Resolve paths
     file_path = Path(os.path.abspath(__file__))
     parent_folder = file_path.parent
-
     data_path = parent_folder.parent / args.f_data
     base_path = parent_folder.parent / args.f
-
     TRAIN_GRAPHS = str(data_path / "train_graphs.pkl")
     VAL_GRAPHS = str(data_path / "validation_graphs.pkl")
     TEST_GRAPHS = str(data_path / "test_graphs.pkl")
-
     MODEL_PATH = str(base_path / "model_checkpoint.pt")
     TRAIN_EMB_CSV = str(base_path / "train_embeddings.csv")
+    THRESHOLDS_PATH = str(base_path / f"sim_thresholds_k{args.k}.json")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    for p in [TRAIN_GRAPHS, MODEL_PATH, TRAIN_EMB_CSV]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Missing required file: {p}")
-
-    # --- DYNAMIC CONTEXT LENGTH DETECTION ---
-    if args.max_prompt_length is not None:
+    if args.max_prompt_length is not None: 
         context_len = args.max_prompt_length
-        print(f"Using user-overridden context length: {context_len}")
-    else:
-        # Detect from the base model (or the fine-tuned one if provided)
-        # We use args.base_llm for detection as it's the architecture source
+    else: 
         context_len = get_safe_context_length(args.base_llm, cap=4096)
 
-    # Load GNN
     train_id2emb = load_id2emb(TRAIN_EMB_CSV)
-    emb_dim = len(next(iter(train_id2emb.values())))
-
     print(f"Loading GNN checkpoint: {MODEL_PATH}")
-    gnn = load_gnn_from_checkpoint(
-        model_path=MODEL_PATH,
-        device=device,
-        x_map=x_map,
-        e_map=e_map,
-    )
+    gnn = load_gnn_from_checkpoint(model_path=MODEL_PATH, device=device, x_map=x_map, e_map=e_map)
     gnn.eval()
 
-    # Fine-tune
     llm_dir = args.out_llm_dir
     use_lora = args.use_lora and (not args.no_lora)
+    global_thresholds = None
+    
+    # ---------------------------------------------------------
+    # 1. THRESHOLD STRATEGY
+    # ---------------------------------------------------------
+    # We need thresholds to be consistent between Train and Test.
+    global_thresholds = None
+
+    # If we are training, we MUST compute them from training data
+    if args.do_finetune:
+        print("Computing global similarity thresholds from Training Data...")
+        
+        # We need the training GNN embeddings to compute thresholds
+        # (Re-using the logic from build_dataset briefly to get sims)
+        train_id2emb = load_id2emb(TRAIN_EMB_CSV)
+        train_ids = list(train_id2emb.keys())
+        train_tgt_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
+        train_tgt_embs = F.normalize(train_tgt_embs, dim=-1)
+        
+        # Encode Train Graphs
+        print("Encoding training graphs for threshold calibration...")
+        train_gnn_embs, _ = encode_graphs(gnn, TRAIN_GRAPHS, device=device, batch_size=args.encode_batch_size)
+        
+        # Leave-one-out KNN
+        # (We only need the sims, not the indices, to determine distribution)
+        # Note: This is fast on GPU
+        sims = train_gnn_embs @ train_tgt_embs.t()
+        # Mask self
+        n = len(train_ids)
+        mask = torch.eye(n, device=device).bool()
+        sims.masked_fill_(mask, -float('inf'))
+        
+        # Get top k
+        top_sims, _ = torch.topk(sims, k=args.k, dim=-1)
+        
+        # Compute & Save
+        global_thresholds = compute_similarity_thresholds(top_sims)
+        save_thresholds(global_thresholds, THRESHOLDS_PATH)
+
+    # If we are NOT training but generating, we load them
+    elif args.do_generate:
+        try:
+            global_thresholds = load_thresholds(THRESHOLDS_PATH)
+        except FileNotFoundError:
+            raise FileNotFoundError("Threshold file not found.")
 
     if args.do_finetune:
-        print("Building KNN dataset from TRAIN split (leave-one-out KNN)...")
-        
-        # --- Pass tokenizer to dataset builder ---
-        knn_ds = build_knn_prompt_dataset(
-            gnn_model=gnn,
-            train_graphs=TRAIN_GRAPHS,
-            train_emb_csv=TRAIN_EMB_CSV,
-            device=device,
-            k=args.k,
-            encode_batch_size=args.encode_batch_size,
-            tokenizer_or_path=args.base_llm,
-            max_prompt_length=context_len,
-            max_samples=args.max_train_samples,
-            leave_one_out=True,
-        )
-        print(f"KNN dataset size: {len(knn_ds)}")
-
+        print("Building KNN dataset...")
+        knn_ds = build_knn_prompt_dataset(gnn_model=gnn, train_graphs=TRAIN_GRAPHS, train_emb_csv=TRAIN_EMB_CSV, 
+                                          device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
+                                          tokenizer_or_path=args.base_llm, thresholds=global_thresholds, max_prompt_length=context_len, 
+                                          max_samples=args.max_train_samples, leave_one_out=True)
         llm_dir = args.base_llm
-
         if args.do_sft:
             sft_dir = str(base_path / (args.out_llm_dir + "_sft"))
             print(f"Running SFT -> {sft_dir}")
-            llm_dir = sft_finetune_on_knn(
-                base_model_name_or_path=args.base_llm,
-                output_dir=sft_dir,
-                train_dataset=knn_ds,
-                device=device,
-                use_lora=use_lora,
-                num_train_steps=args.sft_steps,
-                learning_rate=args.sft_lr,
-                per_device_train_batch_size=args.per_device_bs,
-                gradient_accumulation_steps=args.grad_accum,
-                max_prompt_length=context_len,
-                max_completion_length=args.max_new_tokens,
-                bf16=False,
-                fp16=torch.cuda.is_available(),
-            )
-            print(f"SFT model saved to: {llm_dir}")
+            llm_dir = sft_finetune_on_knn(base_model_name_or_path=args.base_llm, output_dir=sft_dir, train_dataset=knn_ds, 
+                                        device=device, use_lora=use_lora, num_train_steps=args.sft_steps, 
+                                        learning_rate=args.sft_lr, per_device_train_batch_size=args.per_device_bs, 
+                                        gradient_accumulation_steps=args.grad_accum, max_prompt_length=context_len, 
+                                        max_completion_length=args.max_new_tokens, bf16=False, fp16=torch.cuda.is_available())
 
         if args.rl_algo is not None:
             print("Running RL fine-tuning...")
-            llm_dir = finetune_base_model(
-                base_model_name_or_path=llm_dir,  # NOTE: SFT output if --do_sft, else base_llm
-                output_dir=str((base_path / args.out_llm_dir)),
-                train_dataset=knn_ds,
-                device=device,
-                rl_algo=args.rl_algo,
-                use_lora=use_lora,
-                num_train_steps=args.steps,
-                learning_rate=args.lr,
-                per_device_train_batch_size=args.per_device_bs,
-                gradient_accumulation_steps=args.grad_accum,
-                max_prompt_length=context_len,
-                num_generations=args.num_generations,
-                bert_reward_batch_size=args.bert_reward_bs,
-                bf16=False,
-                fp16=torch.cuda.is_available(),
-            )
-            print(f"Saved fine-tuned model to: {llm_dir}")
+            llm_dir = rl_finetune_on_knn(base_model_name_or_path=llm_dir, output_dir=str((base_path / args.out_llm_dir)), 
+                                          train_dataset=knn_ds, device=device, rl_algo=args.rl_algo, use_lora=use_lora, 
+                                          num_train_steps=args.rl_steps, learning_rate=args.lr, 
+                                          per_device_train_batch_size=args.per_device_bs, 
+                                          gradient_accumulation_steps=args.grad_accum, max_prompt_length=context_len, 
+                                          num_generations=args.num_generations, bert_reward_batch_size=args.bert_reward_bs, 
+                                          bf16=False, fp16=torch.cuda.is_available())
 
-    # Generate
     if args.do_generate:
         if args.split in ("validation", "val"):
             query_graphs = VAL_GRAPHS
@@ -1647,35 +1146,16 @@ def main():
             query_graphs = TEST_GRAPHS
             out_csv = str(base_path / f"test_knn_gen_k{args.k}.csv")
             eval_flag = False
-
-        if not os.path.exists(query_graphs):
-            raise FileNotFoundError(f"Missing split graphs: {query_graphs}")
-
         llm_path = llm_dir
         if not os.path.isabs(llm_path):
             candidate = base_path / llm_path
-            if candidate.exists():
-                llm_path = str(candidate)
-
+            if candidate.exists(): llm_path = str(candidate)
         print(f"Generating with model: {llm_path}")
-        generate_desc(
-            gnn_model=gnn,
-            llm_dir_or_name=llm_path,
-            train_graphs=TRAIN_GRAPHS,
-            query_graphs=query_graphs,
-            train_emb_csv=TRAIN_EMB_CSV,
-            device=device,
-            k=args.k,
-            out_csv=out_csv,
-            encode_batch_size=args.encode_batch_size,
-            gen_batch_size=args.gen_batch_size,
-            max_new_tokens=args.max_new_tokens,
-            evaluate=eval_flag,
-        )
-
-    if (not args.do_finetune) and (not args.do_generate):
-        print("Nothing to do. Use --do_finetune and/or --do_generate.")
-
+        generate_desc(gnn_model=gnn, llm_dir_or_name=llm_path, train_graphs=TRAIN_GRAPHS, 
+                      query_graphs=query_graphs, train_emb_csv=TRAIN_EMB_CSV, device=device, 
+                      k=args.k, out_csv=out_csv, thresholds=global_thresholds,
+                      encode_batch_size=args.encode_batch_size, gen_batch_size=args.gen_batch_size, 
+                      max_new_tokens=args.max_new_tokens, evaluate=eval_flag, max_length=context_len)
 
 if __name__ == "__main__":
     main()

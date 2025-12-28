@@ -26,7 +26,7 @@ if __name__ == "__main__":
 
     # Configuration
     MAX_TOKEN_LENGTH = 128
-    BATCH_SIZE = 32  # tune this (16/32/64 depending on GPU)
+    BATCH_SIZE = 32 
     base_model = "Allanatrix/nexa-Llama-sci7b"
     finetuned = "zjunlp/llama-molinst-molecule-7b"
 
@@ -45,7 +45,7 @@ if __name__ == "__main__":
     model = LlamaForCausalLM.from_pretrained(
         base_model,
         load_in_8bit=True,
-        dtype=torch.float16,     # use torch_dtype (preferred)
+        dtype=torch.float16,    
         device_map={"": 0}
     )
     model = PeftModel.from_pretrained(
