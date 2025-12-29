@@ -256,32 +256,18 @@ def load_molgnn_from_checkpoint(
 # =========================================================
 # Main Training Loop
 # =========================================================
-def main(data_folder, output_folder):
+def main(parent_folder, folder):
     print(f"Device: {DEVICE}")
 
-    # RESOLVE PATHS
-    file_path = Path(os.path.abspath(__file__))
-    parent_folder = file_path.parent
-    
-    data_path = parent_folder.parent / data_folder
-    save_path = parent_folder.parent / output_folder
-    os.makedirs(save_path, exist_ok=True)
+    train_emb = load_id2emb(TRAIN_EMB_CSV)
+    val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
 
-    TRAIN_GRAPHS = str(data_path / "train_graphs.pkl")
-    VAL_GRAPHS   = str(data_path / "validation_graphs.pkl")
-
-    # FIXED: Load embeddings from source DATA folder, not output folder
-    TRAIN_EMB_CSV = str(data_path / "train_embeddings.csv")
-    VAL_EMB_CSV   = str(data_path / "validation_embeddings.csv")
+    emb_dim = len(next(iter(train_emb.values())))
 
     if not os.path.exists(TRAIN_GRAPHS):
         print(f"Error: Preprocessed graphs not found at {TRAIN_GRAPHS}")
+        print("Please run: python prepare_graph_data.py")
         return
-    
-    # Load Data
-    train_emb = load_id2emb(TRAIN_EMB_CSV)
-    val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
-    emb_dim = len(next(iter(train_emb.values())))
 
     train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
@@ -323,6 +309,9 @@ def main(data_folder, output_folder):
     early_stopper.load_best_weights(mol_enc)
     print(f"Final Best MRR: {early_stopper.best_score:.4f}")
 
+    save_path = parent_folder.parent / folder
+    os.makedirs(str(save_path), exist_ok=True)
+
     # Save Model
     config = {
         "model_class": "MolGNN",
@@ -349,7 +338,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     data_folder = args.f_data
     folder = args.f
-    
+
     # =========================================================
     # CONFIG
     # =========================================================
@@ -369,7 +358,7 @@ if __name__ == "__main__":
 
     # Training parameters
     BATCH_SIZE = 64
-    EPOCHS = 50
+    EPOCHS = 2
     PATIENCE = 5
     LR = 1e-3
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -377,4 +366,4 @@ if __name__ == "__main__":
     HIDDEN = 256
     LAYERS = 3
 
-    main(data_folder=data_path, output_folder=base_path)
+    main(parent_folder, folder)
