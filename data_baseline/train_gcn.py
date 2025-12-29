@@ -13,11 +13,13 @@ try:
         load_id2emb,
         PreprocessedGraphDataset, collate_fn, x_map, e_map
     )
+    from.training_utils import EarlyStopping
 except:
     from data_utils import (
         load_id2emb,
         PreprocessedGraphDataset, collate_fn, x_map, e_map
     )
+    from training_utils import EarlyStopping
 
 from pathlib import Path
 from argparse import ArgumentParser
@@ -254,40 +256,74 @@ def load_molgnn_from_checkpoint(
 # =========================================================
 # Main Training Loop
 # =========================================================
-def main(folder):
+def main(data_folder, output_folder):
     print(f"Device: {DEVICE}")
 
-    train_emb = load_id2emb(TRAIN_EMB_CSV)
-    val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
+    # RESOLVE PATHS
+    file_path = Path(os.path.abspath(__file__))
+    parent_folder = file_path.parent
+    
+    data_path = parent_folder.parent / data_folder
+    save_path = parent_folder.parent / output_folder
+    os.makedirs(save_path, exist_ok=True)
 
-    emb_dim = len(next(iter(train_emb.values())))
+    TRAIN_GRAPHS = str(data_path / "train_graphs.pkl")
+    VAL_GRAPHS   = str(data_path / "validation_graphs.pkl")
+
+    # FIXED: Load embeddings from source DATA folder, not output folder
+    TRAIN_EMB_CSV = str(data_path / "train_embeddings.csv")
+    VAL_EMB_CSV   = str(data_path / "validation_embeddings.csv")
 
     if not os.path.exists(TRAIN_GRAPHS):
         print(f"Error: Preprocessed graphs not found at {TRAIN_GRAPHS}")
-        print("Please run: python prepare_graph_data.py")
         return
     
+    # Load Data
+    train_emb = load_id2emb(TRAIN_EMB_CSV)
+    val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
+    emb_dim = len(next(iter(train_emb.values())))
+
     train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
     train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
     val_ds = PreprocessedGraphDataset(VAL_GRAPHS, val_emb)
     val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
+    # Init Model
     mol_enc = MolGNN(out_dim=emb_dim, hidden=HIDDEN, layers=LAYERS, x_map=x_map, e_map=e_map).to(DEVICE)
-
     optimizer = torch.optim.Adam(mol_enc.parameters(), lr=LR)
+    
+    # Init Early Stopping
+    early_stopper = EarlyStopping(patience=PATIENCE, mode='max')
 
+    print(f"Start Training: {EPOCHS} epochs, Batch: {BATCH_SIZE}, Hidden: {HIDDEN}")
+
+    # Training Loop
     for ep in range(EPOCHS):
         train_loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
-
         val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE, dl=val_dl)
-        str_val_scores = {key:f'{val:.4f}' for key, val in val_scores.items()}
-        print(f"Epoch {ep+1}/{EPOCHS} - loss={train_loss:.4f} - val={str_val_scores}")
+        
+        current_mrr = val_scores['MRR']
+        str_val = " | ".join([f"{k}: {v:.4f}" for k, v in val_scores.items()])
+        print(f"Epoch {ep+1}/{EPOCHS} | loss={train_loss:.4f} | {str_val}")
 
-    save_path = parent_folder.parent / folder
-    os.makedirs(str(save_path), exist_ok=True)
+        # Check Early Stopping
+        stop_signal, is_best = early_stopper.check_stop(mol_enc, current_mrr, ep)
+        
+        if is_best:
+            print(f"  → New best MRR: {current_mrr:.4f}")
+        else:
+            print(f"  → No improvement ({early_stopper.patience_count}/{early_stopper.patience})")
 
-    # ---- Save model config ----
+        if stop_signal:
+            print(f"\nEarly stopping triggered at epoch {ep+1}")
+            break
+
+    # Restore best weights
+    early_stopper.load_best_weights(mol_enc)
+    print(f"Final Best MRR: {early_stopper.best_score:.4f}")
+
+    # Save Model
     config = {
         "model_class": "MolGNN",
         "hidden": HIDDEN,
@@ -295,18 +331,15 @@ def main(folder):
         "layers": LAYERS,
         "uses_edge_features": True,
     }
-
     config_path = str(save_path / "model_config.json")
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    # ---- Save weights ----
     model_path = str(save_path / "model_checkpoint.pt")
     torch.save(mol_enc.state_dict(), model_path)
 
     print(f"\nModel saved to {model_path}")
     print(f"Config saved to {config_path}")
-
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -337,6 +370,7 @@ if __name__ == "__main__":
     # Training parameters
     BATCH_SIZE = 64
     EPOCHS = 50
+    PATIENCE = 5
     LR = 1e-3
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
