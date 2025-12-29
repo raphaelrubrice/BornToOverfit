@@ -16,6 +16,7 @@ from argparse import ArgumentParser
 from typing import Dict, List, Tuple, Optional, Any
 from tqdm.auto import tqdm
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -30,9 +31,11 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
     GenerationConfig,
+    Seq2SeqTrainer,
     Trainer,
     TrainingArguments,
     TrainerCallback,
+    EarlyStoppingCallback,
     DataCollatorForSeq2Seq, 
     DataCollatorWithPadding
 )
@@ -275,34 +278,46 @@ def fit_neighbors_fast(
     neighbor_descs: List[str],
     neighbor_cards: List[str],
     neighbor_tags: List[str],
-    desc_cache: TokenLengthCache,
-    card_cache: TokenLengthCache,
+    desc_cache,
+    card_cache,
     max_length: int = 1024
 ) -> str:
     """
     Constructs prompt using pre-computed token lengths (integer math) 
-    instead of repeated tokenization.
+    instead of repeated tokenization, updated with strict Execution Protocol.
     """
     
+    # UPDATED: New Base Instruction with Protocol
     base_instruction = (
-        "You are an expert chemist. Generate a factual description of the Query Molecule based on its feature card.\n"
-        "You are provided with K nearest neighbors, tagged by their similarity (e.g., [VERY_CLOSE], [DISTANT]).\n\n"
-        "**Guidance on Using Neighbors:**\n"
-        "- **[VERY_CLOSE] / [CLOSE]**: Highly reliable. The neighbor likely shares the scaffold and key functional groups. You may infer chemical class from these.\n"
-        "- **[AVERAGE]**: Partially relevant. Shares some features but likely differs in others.\n"
-        "- **[DISTANT] / [VERY_DISTANT]**: Unreliable for content. Use these ONLY for formatting/style. Do not copy their chemical features.\n\n"
-        "**Strict Constraint**: The 'Query Molecule Card' is the ground truth. Never hallucinate features from neighbors that contradict the card."
+        "You are an expert chemist. Generate a factual description of the [QUERY MOLECULE] based on its feature card. "
+        "You are provided with K nearest neighbors, tagged by their similarity.\n\n"
+        "**Guidance on Neighbor Reliability:**\n"
+        "* **[VERY_CLOSE] / [CLOSE]:** Highly reliable. The neighbor likely shares the scaffold and key functional groups. **Prioritize these as templates.**\n"
+        "* **[AVERAGE]:** Partially relevant. Shares some features but likely differs in others.\n"
+        "* **[DISTANT] / [VERY_DISTANT]:** Unreliable for content. Use these **ONLY** for sentence structure/style. Do not copy their chemical features.\n\n"
+        "**Execution Protocol:**\n"
+        "1.  **Select Template:** Review the [CONTEXT]. If applicable, identify the **[CLOSE]** neighbor that shares the most similar **Elements (formula)** and **Ring/Aromatic counts** to the Query. Use its description as your starting point.\n"
+        "2.  **Verify Charge (Strict):** Check the `formal_charge_net` of the Query:\n"
+        "    * -1: \"monoanion\" | -2: \"dianion\" | -3: \"trianion\" | -4: \"tetraanion\"\n"
+        "    * *Constraint:* For exemple, if the neighbor is a \"trianion\" (-3) but the Query is -4, you **MUST** write \"tetraanion\".\n"
+        "3.  **Adjust for Chemical Differences:**\n"
+        "    * **Formula:** Compare `elements`. For exemple, if the Query has extra Oxygen (O) or Phosphate (P) compared to the template, you must update the nomenclature (e.g., changing \"cyclic phosphate\" $\\to$ \"phosphate\" or \"diphosphate\").\n"
+        "    * **Structure:** Use the Query's `bond_types` and `hybridization` to ensure physical accuracy.\n"
+        "4.  **Inference:** Biomedical functionality can be inferred **only** if supported by a [CLOSE] neighbor and consistent with the Query's structure.\n\n"
+        "**Strict Constraint:** The 'Query Molecule Card' is the ground truth. Never hallucinate features from neighbors that contradict the card."
     )
 
+    # UPDATED: New Footer Trigger
     footer = (
         "\n\n[QUERY MOLECULE]\n"
         f"Card: {query_card.strip() if query_card else 'UNKNOWN'}\n"
-        "Description:" 
+        "**Generate the description strictly adhering to the Protocol and Constraints:**"
     )
 
     # Estimate static parts once (approx overhead)
     # We cache this locally to avoid re-encoding constant strings
     if not hasattr(fit_neighbors_fast, "static_overhead"):
+        # We include the context markers in the overhead calculation
         fit_neighbors_fast.static_overhead = len(tokenizer.encode(base_instruction + "\n[CONTEXT]\n[/CONTEXT]" + footer, add_special_tokens=False))
         # Estimate per-neighbor template overhead: "\n[NEIGHBOR_X TAG]\nCard: \nDescription: "
         fit_neighbors_fast.template_overhead = len(tokenizer.encode("\n[NEIGHBOR_1 [VERY_CLOSE]]\nCard: \nDescription: ", add_special_tokens=False))
@@ -341,6 +356,7 @@ def fit_neighbors_fast(
             f"{footer}"
         )
     else:
+        # Fallback if no neighbors fit
         return f"{base_instruction}{footer}"
 
 
@@ -606,9 +622,10 @@ def sft_finetune_on_knn(
     output_dir: str,
     train_dataset: Dataset,
     device: str,
+    eval_dataset: Optional[Dataset] = None,
     use_lora: bool = True,
-    lora_r: int = 16,
-    lora_alpha: int = 32,
+    lora_r: int = 128,
+    lora_alpha: int = None,
     lora_dropout: float = 0.05,
     max_prompt_length: int = 1024,
     max_completion_length: int = 192,
@@ -619,78 +636,310 @@ def sft_finetune_on_knn(
     bf16: bool = False,
     fp16: bool = True,
     seed: int = 42,
+    patience: int = None,
+    use_early_stopping: bool = False,
+    neftune_noise_alpha: float = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     config = AutoConfig.from_pretrained(base_model_name_or_path)
-    if bf16: dtype = torch.bfloat16
-    elif fp16: dtype = torch.float16 if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.bfloat16
-    else: dtype = torch.float32
 
-    model_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
-    model = model_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
+    # Determine standard floating point type based on arguments and hardware
+    if bf16:
+        dtype = torch.bfloat16
+    elif fp16:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+    else:
+        dtype = torch.float32
+
+    # Set default LoRA alpha if not provided
+    if lora_alpha is None:
+        lora_alpha = 2 * lora_r
+
+    # Set default patience for Early Stopping
+    if patience is None:
+        # Defaults to 5 or 5% of training steps, whichever is smaller
+        patience = min(5, int(0.05 * num_train_steps))
+
+    # Initialize Model
+    if config.is_encoder_decoder:
+        model_cls = AutoModelForSeq2SeqLM
+    else:
+        model_cls = AutoModelForCausalLM
+
+    model = model_cls.from_pretrained(
+        base_model_name_or_path,
+        dtype=dtype,
+        device_map="auto"
+    )
     model.gradient_checkpointing_enable()
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True)
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right" if config.is_encoder_decoder else "left"
+    # Initialize Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_name_or_path,
+        use_fast=True,
+        trust_remote_code=True
+    )
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
+    if config.is_encoder_decoder:
+        tokenizer.padding_side = "right"
+    else:
+        # Causal models usually need left padding for generation, 
+        # but right padding is often standard for training. 
+        # Seq2SeqTrainer handles this, but "left" is safer for batched generation.
+        tokenizer.padding_side = "left"
+
+    # Configure LoRA
     if use_lora:
-        lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
+        if config.is_encoder_decoder:
+            task_type = "SEQ_2_SEQ_LM"
+        else:
+            task_type = "CAUSAL_LM"
+
+        lora_cfg = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias="none",
+            task_type=task_type,
+            target_modules="all-linear"
+        )
         model = get_peft_model(model, lora_cfg)
-        if hasattr(model, "enable_input_require_grads"): model.enable_input_require_grads()
+        
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+            
         model.print_trainable_parameters()
 
-    def _tokenize_row(ex):
+    # --- Tokenization Logic ---
+    def _tokenize(ex, is_eval=False):
         prompt_msgs = ex["prompt"]
         ref = ex["reference"] or ""
         prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
-        
-        if config.is_encoder_decoder:
-            model_inputs = tokenizer(prompt_text, max_length=max_prompt_length, truncation=True)
-            labels = tokenizer(text_target=ref, max_length=max_completion_length, truncation=True)["input_ids"]
-            if len(labels) > 0 and labels[-1] != tokenizer.eos_token_id:
-                if len(labels) >= max_completion_length: labels[-1] = tokenizer.eos_token_id 
-                else: labels.append(tokenizer.eos_token_id)
+
+        # CASE 1: Encoder-Decoder OR Evaluation (Generation) Mode
+        # We separate inputs and labels so `predict_with_generate` works correctly.
+        if config.is_encoder_decoder or is_eval:
+            model_inputs = tokenizer(
+                prompt_text,
+                max_length=max_prompt_length,
+                truncation=True
+            )
+            labels = tokenizer(
+                text_target=ref,
+                max_length=max_completion_length,
+                truncation=True
+            )["input_ids"]
             model_inputs["labels"] = labels
             return model_inputs
 
+        # CASE 2: CausalLM Training (Standard)
+        # We concatenate Prompt + Response and mask the prompt in the labels.
         full_text = prompt_text + " " + ref + tokenizer.eos_token
-        full = tokenizer(full_text, max_length=max_prompt_length + max_completion_length, truncation=True, add_special_tokens=True)
+        full = tokenizer(
+            full_text,
+            max_length=max_prompt_length + max_completion_length,
+            truncation=True,
+            add_special_tokens=True
+        )
+        
         input_ids = full["input_ids"]
         labels = input_ids.copy()
-        prompt_ids = tokenizer(prompt_text, max_length=max_prompt_length, truncation=True, add_special_tokens=False)["input_ids"]
+
+        # Determine prompt length to mask it
+        prompt_ids = tokenizer(
+            prompt_text,
+            max_length=max_prompt_length,
+            truncation=True,
+            add_special_tokens=False
+        )["input_ids"]
+        
         prompt_len = len(prompt_ids)
-        if tokenizer.bos_token_id and input_ids[0] == tokenizer.bos_token_id: prompt_len += 1
-        for i in range(min(prompt_len, len(labels))): labels[i] = -100
+        # Adjust for BOS token if present
+        if tokenizer.bos_token_id and input_ids[0] == tokenizer.bos_token_id:
+            prompt_len += 1
+
+        # Mask the prompt part in labels using -100
+        for i in range(min(prompt_len, len(labels))):
+            labels[i] = -100
+            
         full["labels"] = labels
         return full
 
-    tokenized = train_dataset.map(_tokenize_row, remove_columns=train_dataset.column_names)
+    # Apply tokenization
+    tokenized_train = train_dataset.map(
+        lambda x: _tokenize(x, is_eval=False),
+        remove_columns=train_dataset.column_names
+    )
 
-    if config.is_encoder_decoder:
-        data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True, label_pad_token_id=-100)
-    else:
-        base_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True, return_tensors="pt")
-        def _causal_collate(features):
-            labels = [f.pop("labels") for f in features] if "labels" in features[0] else None
-            batch = base_collator(features)
-            if labels is not None:
-                batch_len = batch["input_ids"].shape[1]
-                padded_labels = []
-                for l in labels:
-                    pad_len = batch_len - len(l)
-                    padded_labels.append([-100] * pad_len + l) # Left padding
-                batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
-            return batch
-        data_collator = _causal_collate
+    tokenized_eval = None
+    if eval_dataset is not None:
+        print("Tokenizing validation set for Generation Metrics...")
+        # Important: is_eval=True ensures prompts and labels are split
+        tokenized_eval = eval_dataset.map(
+            lambda x: _tokenize(x, is_eval=True),
+            remove_columns=eval_dataset.column_names
+        )
 
-    args = TrainingArguments(output_dir=output_dir, max_steps=num_train_steps, per_device_train_batch_size=per_device_train_batch_size, gradient_accumulation_steps=gradient_accumulation_steps, learning_rate=learning_rate, logging_steps=int(0.1*num_train_steps), save_steps=200, save_total_limit=2, bf16=bf16, fp16=(fp16 and not bf16), report_to=[], seed=seed, remove_unused_columns=False, gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})
+    # --- Compute Metrics Function (BLEU + BERTScore) ---
+    def compute_metrics(eval_preds):
+        preds, labels = eval_preds
+        
+        if isinstance(preds, tuple):
+            preds = preds[0]
+
+        # Decode generated predictions
+        decoded_preds = tokenizer.batch_decode(
+            preds,
+            skip_special_tokens=True
+        )
+
+        # Decode labels (replacing -100 with Pad ID)
+        if isinstance(labels, np.ndarray):
+            labels = np.where(
+                labels != -100, 
+                labels, 
+                tokenizer.pad_token_id
+            )
+        
+        decoded_labels = tokenizer.batch_decode(
+            labels,
+            skip_special_tokens=True
+        )
+
+        # Basic Cleanup
+        decoded_preds = [p.strip().lower() for p in decoded_preds]
+        decoded_labels = [l.strip().lower() for l in decoded_labels]
+
+        # 1. BLEU-4
+        # sacrebleu expects: references=[[ref1, ref2, ...]]
+        bleu_res = sacrebleu.corpus_bleu(
+            decoded_preds, 
+            [decoded_labels], 
+            lowercase=True
+        )
+        bleu4 = bleu_res.score
+
+        # 2. BERTScore
+        try:
+            # Using function wrapper from bert_score
+            P, R, F1 = bertscore(
+                decoded_preds,
+                decoded_labels,
+                model_type="roberta-base",
+                lang="en",
+                device=device,
+                verbose=False,
+                batch_size=len(decoded_preds)
+            )
+            bert_f1 = F1.mean().item()
+        except Exception as e:
+            print(f"Warning: BERTScore computation failed: {e}")
+            bert_f1 = 0.0
+
+        # 3. Final Proxy Metric
+        # Normalize BLEU (0-100) to (0-1) and average with BERTScore F1
+        final_proxy = 0.5 * (bleu4 / 100.0) + 0.5 * bert_f1
+
+        return {
+            "bleu4": bleu4,
+            "bertscore_f1": bert_f1,
+            "final_proxy": final_proxy
+        }
+
+    # Data Collator
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        label_pad_token_id=-100
+    )
+
+    # --- Evaluation & Early Stopping Setup ---
+    callbacks = []
+    eval_strategy = "no"
+    load_best = False
+    metric_for_best = None
     
-    trainer = Trainer(model=model, args=args, train_dataset=tokenized, data_collator=data_collator, tokenizer=tokenizer)
+    # We only set up evaluation steps if we have an eval dataset
+    if tokenized_eval is not None:
+        eval_strategy = "steps"
+        # Evaluate roughly 20 times over the course of training
+        eval_steps = max(20, num_train_steps // 20)
+        
+        # Only enable Early Stopping if explicitly requested AND we have a val set
+        if use_early_stopping:
+            print(f"Enabling Early Stopping (Patience={patience}) based on final_proxy...")
+            callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))
+            load_best = True
+            metric_for_best = "final_proxy"
+    else:
+        eval_steps = 0
+
+    if eval_strategy == "steps":
+        save_strategy = "steps"
+    else:
+        save_strategy = "no"
+
+    args = TrainingArguments(
+        output_dir=output_dir,
+        max_steps=num_train_steps,
+        per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        neftune_noise_alpha=neftune_noise_alpha,
+        
+        # Eval & Save Strategy
+        evaluation_strategy=eval_strategy,
+        eval_steps=eval_steps,
+        save_strategy=save_strategy,
+        save_steps=eval_steps,
+        save_total_limit=2,
+        
+        # Early Stopping Configuration
+        load_best_model_at_end=load_best,
+        metric_for_best_model=metric_for_best,
+        greater_is_better=True,
+        
+        # Generation Configuration for Metric Computation
+        predict_with_generate=True if tokenized_eval is not None else False,
+        generation_max_length=max_completion_length,
+        
+        bf16=bf16,
+        fp16=(fp16 and not bf16),
+        report_to=[],
+        seed=seed,
+        gradient_checkpointing=True,
+        remove_unused_columns=False,
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    # Use Seq2SeqTrainer to support predict_with_generate
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+        callbacks=callbacks,
+        compute_metrics=compute_metrics if tokenized_eval is not None else None
+    )
+
     trainer.train()
-    if use_lora: model = model.merge_and_unload()
+
+    if use_lora:
+        model = model.merge_and_unload()
+    
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    
     return output_dir
 
 # --------------------------------------------------------------------------------------
@@ -703,8 +952,8 @@ def rl_finetune_on_knn(
     device: str,
     rl_algo: str = "ppo",
     use_lora: bool = True,
-    lora_r: int = 16,
-    lora_alpha: int = 32,
+    lora_r: int = 128,
+    lora_alpha: int = None,
     lora_dropout: float = 0.05,
     max_prompt_length: int = 1024,
     max_completion_length: int = 192,
@@ -725,10 +974,17 @@ def rl_finetune_on_knn(
     tokenizer.padding_side = "left"
     config = AutoConfig.from_pretrained(base_model_name_or_path)
 
-    if bf16: dtype = torch.bfloat16
-    elif fp16: dtype = torch.float16 if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.bfloat16
-    else: dtype = torch.float32
-        
+    if bf16: 
+        dtype = torch.bfloat16
+    elif fp16: 
+        dtype = torch.float16 if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.bfloat16
+    else: 
+        dtype = torch.float32
+    
+    # Using Lora alpha = 2 * lora_r
+    if lora_alpha is None:
+        lora_alpha = 2 * lora_r
+
     if rl_algo == "ppo":
         model_cls = AutoModelForSeq2SeqLMWithValueHead if config.is_encoder_decoder else AutoModelForCausalLMWithValueHead
         base_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
@@ -1082,6 +1338,9 @@ def main():
 
     parser.add_argument("--sft_steps", default=800, type=int)
     parser.add_argument("--sft_lr", default=2e-5, type=float)
+    parser.add_argument("--sft_early_stopping", action="store_true", help="Enable early stopping based on validation metrics")
+    parser.add_argument("--sft_neftune", action="store_true", help="Enable NEFTune noise alpha=5")
+    parser.add_argument("--sft_lora", default=128, type=int, help="LoRA rank for SFT")
 
     parser.add_argument("--split", default="test", choices=["validation", "val", "test"])
     parser.add_argument("--gen_batch_size", default=4, type=int)
@@ -1171,15 +1430,34 @@ def main():
             raise FileNotFoundError("Threshold file not found.")
 
     if args.do_finetune:
-        print("Building KNN dataset...")
-        knn_ds = build_knn_prompt_dataset(gnn_model=gnn, train_graphs=TRAIN_GRAPHS, train_emb_csv=TRAIN_EMB_CSV, 
-                                          device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
-                                          tokenizer_or_path=args.base_llm, thresholds=global_thresholds, max_prompt_length=context_len, 
-                                          max_samples=args.max_train_samples, leave_one_out=True)
+        print("Building KNN dataset (TRAIN)...")
+        knn_ds = build_knn_prompt_dataset(
+            gnn_model=gnn, train_graphs=TRAIN_GRAPHS, train_emb_csv=TRAIN_EMB_CSV, 
+            device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
+            tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
+            max_prompt_length=context_len, max_samples=args.max_train_samples, 
+            leave_one_out=True
+        )
+        
+        # <--- NEW: Build Validation Dataset for Early Stopping --->
+        knn_val_ds = None
+        if args.do_sft: 
+            print("Building KNN dataset (VAL) for Early Stopping...")
+            # Note: We use VAL_GRAPHS as the "query", but still retrieve from TRAIN_EMB_CSV
+            knn_val_ds = build_knn_prompt_dataset(
+                gnn_model=gnn, 
+                train_graphs=VAL_GRAPHS, # <--- Use Val graphs here
+                train_emb_csv=TRAIN_EMB_CSV, 
+                device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
+                tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
+                max_prompt_length=context_len, 
+                # We don't need leave_one_out for validation since val graphs aren't in the train DB
+                leave_one_out=False 
+            )
         
         print("Optimizing memory for SFT...")
         
-        # 1. Move GNN to CPU (Don't delete it, just get it off the GPU)
+        # 1. Move GNN to CPU
         gnn.cpu()
         
         # 2. Clear Python variables holding GPU tensors
@@ -1200,11 +1478,29 @@ def main():
         if args.do_sft:
             sft_dir = str(base_path / (args.out_llm_dir + "_sft"))
             print(f"Running SFT -> {sft_dir}")
-            llm_dir = sft_finetune_on_knn(base_model_name_or_path=args.base_llm, output_dir=sft_dir, train_dataset=knn_ds, 
-                                        device=device, use_lora=use_lora, num_train_steps=args.sft_steps, 
-                                        learning_rate=args.sft_lr, per_device_train_batch_size=args.per_device_bs, 
-                                        gradient_accumulation_steps=args.grad_accum, max_prompt_length=context_len, 
-                                        max_completion_length=args.max_new_tokens, bf16=False, fp16=torch.cuda.is_available())
+            
+            # Decide NEFTune alpha
+            neft_alpha = 5.0 if args.sft_neftune else None
+
+            llm_dir = sft_finetune_on_knn(
+                base_model_name_or_path=args.base_llm, 
+                output_dir=sft_dir, 
+                train_dataset=knn_ds, 
+                eval_dataset=knn_val_ds,
+                device=device, 
+                use_lora=use_lora, 
+                lora_r=args.sft_lora,
+                num_train_steps=args.sft_steps, 
+                learning_rate=args.sft_lr, 
+                per_device_train_batch_size=args.per_device_bs, 
+                gradient_accumulation_steps=args.grad_accum, 
+                max_prompt_length=context_len, 
+                max_completion_length=args.max_new_tokens, 
+                bf16=False, 
+                fp16=torch.cuda.is_available(),
+                use_early_stopping=args.sft_early_stopping,
+                neftune_noise_alpha=neft_alpha
+            )
 
         if args.rl_algo is not None:
             print("Running RL fine-tuning...")
