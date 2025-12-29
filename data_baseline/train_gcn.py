@@ -377,4 +377,4 @@ if __name__ == "__main__":
     HIDDEN = 256
     LAYERS = 3
 
-    main(folder)
+    main(data_folder=data_path, output_folder=base_path)
