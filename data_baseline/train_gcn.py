@@ -219,6 +219,7 @@ def load_molgnn_from_checkpoint(
     device: str,
     x_map,
     e_map,
+    **kwargs, # NOT USED, for compatibility
 ):
     """
     Load MolGNN using a saved config + state_dict.

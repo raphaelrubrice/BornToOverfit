@@ -191,6 +191,7 @@ def eval_retrieval(data_path, emb_dict, mol_enc, device, dl=None):
 def load_molgnn_gps_from_checkpoint(
     model_path: str,
     device: str,
+    **kwargs, # NOT USED, for compatibility
 ):
     """
     Load MolGNN using a saved config + state_dict.
