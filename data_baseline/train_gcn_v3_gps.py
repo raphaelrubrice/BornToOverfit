@@ -191,8 +191,6 @@ def eval_retrieval(data_path, emb_dict, mol_enc, device, dl=None):
 def load_molgnn_gps_from_checkpoint(
     model_path: str,
     device: str,
-    x_map,
-    e_map,
 ):
     """
     Load MolGNN using a saved config + state_dict.
@@ -210,15 +208,16 @@ def load_molgnn_gps_from_checkpoint(
 
     model_class = cfg.get("model_class", "MolGNN_GPS")
 
+    # Ensure this loader only loads GPS models
     if model_class != "MolGNN_GPS":
         raise ValueError(f"Unsupported GNN class: {model_class}")
 
     gnn = MolGNN_GPS(
-        hidden=cfg["hidden"],
-        out_dim=cfg["out_dim"],
-        layers=cfg["layers"],
-        x_map=x_map,
-        e_map=e_map,
+        hidden_dim=cfg.get("hidden_dim", HIDDEN_DIM),
+        out_dim=cfg.get("out_dim", 768),
+        num_layers=cfg.get("num_layers", NUM_LAYERS),
+        num_heads=cfg.get("num_heads", NUM_HEADS),
+        dropout=cfg.get("dropout", DROPOUT)
     ).to(device)
 
     state = torch.load(model_path, map_location=device)
