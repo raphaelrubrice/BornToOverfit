@@ -239,8 +239,8 @@ def main(data_folder, output_folder):
     VAL_GRAPHS   = str(data_path / "validation_graphs.pkl")
 
     # FIXED: Load embeddings from source DATA folder, not output folder
-    TRAIN_EMB_CSV = str(data_path / "train_embeddings.csv")
-    VAL_EMB_CSV   = str(data_path / "validation_embeddings.csv")
+    TRAIN_EMB_CSV = str(save_path / "train_embeddings.csv")
+    VAL_EMB_CSV   = str(save_path / "validation_embeddings.csv")
 
     print("=" * 60)
     print("TRAINING MolGNN v3 - GPS Transformer")

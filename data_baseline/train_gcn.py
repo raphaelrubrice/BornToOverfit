@@ -358,7 +358,7 @@ if __name__ == "__main__":
 
     # Training parameters
     BATCH_SIZE = 64
-    EPOCHS = 2
+    EPOCHS = 50
     PATIENCE = 5
     LR = 1e-3
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
