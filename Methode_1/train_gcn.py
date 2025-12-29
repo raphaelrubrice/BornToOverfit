@@ -34,7 +34,7 @@ GPT2_NAME = "gpt2"          # keep for tokenizer & decoder
 MAX_LEN = 128
 
 BATCH_SIZE = 16
-EPOCHS = 3
+EPOCHS = 15
 LR = 5e-5
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.06
