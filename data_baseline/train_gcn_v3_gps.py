@@ -298,7 +298,7 @@ def main(data_folder, output_folder, loss_func):
 
     # Training Loop
     for ep in range(EPOCHS):
-        loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE, loss=loss_func)
+        loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE, loss_func=loss_func)
         val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE, dl=val_dl) if val_emb else {}
         
         str_val = " | ".join([f"{k}: {v:.4f}" for k, v in val_scores.items()])
