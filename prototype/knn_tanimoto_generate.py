@@ -283,53 +283,67 @@ def fit_neighbors_fast(
     max_length: int = 1024
 ) -> str:
     """
-    Constructs a Dynamic Prompt that adapts to data quality (Hybrid Strategy).
-    Handles edge cases (No Structure / No Function) by changing the System Instruction.
+    Constructs a Dynamic Prompt that guarantees Structure and Function context.
+    Adapts instructions based on neighbor quality (High vs Low Similarity).
     """
     
-    # --- 1. Analyze Data Availability ---
-    has_structure = len(struct_neighbors) > 0
-    has_function = len(func_neighbors) > 0
+    # --- 1. Analyze Neighbor Quality ---
+    # Defaults
+    struct_is_strong = False
+    func_is_strong = False
+
+    # Check Structural Quality (Threshold: 0.5 Tanimoto)
+    if struct_neighbors:
+        best_struct_score = struct_neighbors[0]['score']
+        struct_is_strong = best_struct_score >= 0.5
+
+    # Check Functional Quality (Threshold: 0.75 Cosine - distinct from GNN retrieval threshold)
+    if func_neighbors:
+        best_func_score = func_neighbors[0]['score']
+        func_is_strong = best_func_score >= 0.75
     
     # --- 2. Dynamic System Header Construction ---
     
-    # Base Role
     intro = "You are an expert chemist. Generate a factual description of the [QUERY MOLECULE] strictly based on its feature card."
     
-    # Condition A: Structural Templates
-    if has_structure:
+    # Condition A: Structural Instructions
+    if struct_is_strong:
         struct_instr = (
-            "You are provided with **[STRUCTURAL TEMPLATES]** (similar backbones). "
+            "You are provided with **[STRUCTURAL TEMPLATES]** (high similarity). "
             "Use them to determine the sentence structure, IUPAC nomenclature style, and scaffold description. "
-            "However, you MUST update specific atoms/groups to match the [QUERY MOLECULE] Card."
+            "Update specific atoms/groups to match the [QUERY MOLECULE] Card."
         )
     else:
+        # Low confidence fallback
         struct_instr = (
-            "**WARNING: NO STRUCTURAL MATCHES FOUND.** "
-            "The [QUERY MOLECULE] has a unique scaffold. "
-            "Do NOT hallucinate a template. Construct the description **from scratch** based strictly on the SMILES and Card data."
+            "**CAUTION: DISTANT STRUCTURAL MATCH ONLY.** "
+            "The available [STRUCTURAL TEMPLATE] is not a close match. "
+            "Use it **ONLY** for formatting and sentence flow. "
+            "Do NOT infer chemical properties or scaffold details from it. Rely strictly on the Query Card."
         )
 
-    # Condition B: Functional References
-    if has_function:
+    # Condition B: Functional Instructions
+    if func_is_strong:
         func_instr = (
-            "You are provided with **[FUNCTIONAL REFERENCES]** (biologically similar). "
-            "Use them ONLY to identify potential biomedical roles (e.g., 'anti-bacterial', 'metabolite') "
-            "if they align with the query's structure."
+            "You are provided with **[FUNCTIONAL REFERENCES]**. "
+            "Use them to identify potential abstract biomedical roles (e.g., 'anti-bacterial', 'metabolite'). "
+            "**NEVER** copy physical numbers (Mass, Spin) from them."
         )
     else:
+        # Low confidence fallback
         func_instr = (
-            "**NOTE: NO FUNCTIONAL CONTEXT AVAILABLE.** "
-            "Describe the chemical structure and properties only. "
-            "Do NOT infer specific biological applications (like 'anti-cancer') unless explicitly evident from the structure."
+            "**CAUTION: DISTANT FUNCTIONAL REFERENCE.** "
+            "The [FUNCTIONAL REFERENCE] is chemically distant. "
+            "It is likely NOT bio-active in the same way. "
+            "Avoid inferring specific biological roles unless supported by the structure."
         )
 
     # Global Constraints
     constraints = (
         "**Strict Constraints:**\n"
         "1. The [QUERY MOLECULE] Card is the ABSOLUTE GROUND TRUTH.\n"
-        "2. If a neighbor contradicts the Query (e.g., different halogen, different ring count), IGNORE the neighbor.\n"
-        "3. Never mention 'Neighbor 1' or 'Template' in the final output."
+        "2. If a neighbor contradicts the Query, IGNORE the neighbor.\n"
+        "3. Never mention 'Neighbor' or 'Template' in the final output."
     )
     
     # Combine Header
@@ -337,7 +351,6 @@ def fit_neighbors_fast(
 
     # --- 3. Construct Body ---
     
-    # Query Block (Primacy Effect - put it early)
     query_block = (
         "\n\n[QUERY MOLECULE]\n"
         f"Card: {query_card.strip() if query_card else 'UNKNOWN'}\n"
@@ -346,14 +359,13 @@ def fit_neighbors_fast(
     footer = "**Generate the description strictly adhering to the Guidelines:**"
 
     # Estimate Overhead
-    # Headers + Tags + Footer
     static_text = system_header + query_block + "\n[STRUCTURAL TEMPLATES]\n[FUNCTIONAL REFERENCE]\n[/CONTEXT]\n" + footer
     base_len = len(tokenizer.encode(static_text, add_special_tokens=False))
-    remaining_budget = max_length - base_len - 20 # Safety Buffer
+    remaining_budget = max_length - base_len - 20 
 
     # --- 4. Fill Context (Structure First) ---
     struct_text_list = []
-    if has_structure:
+    if struct_neighbors:
         struct_text_list.append("\n[STRUCTURAL TEMPLATES]")
         for i, n in enumerate(struct_neighbors, 1):
             score_display = f"{n['score']:.2f}"
@@ -379,10 +391,11 @@ def fit_neighbors_fast(
     
     # --- 5. Fill Context (Function Second) ---
     func_text_list = []
-    # Only add function if we have budget AND (we have structure OR we have enough space for at least 1)
-    if has_function and remaining_budget > 60:
+    # Always attempt to add at least one functional neighbor if it exists, even if budget is tight
+    if func_neighbors and remaining_budget > 40:
         func_text_list.append("\n\n[FUNCTIONAL REFERENCE]")
         for i, n in enumerate(func_neighbors, 1):
+            score_display = f"{n['score']:.2f}"
             d = n['desc']
             nid = n['id']
             
@@ -392,7 +405,7 @@ def fit_neighbors_fast(
             
             if (d_len + overhead) <= remaining_budget:
                 entry = (
-                    f"\n> Ref {i} (Biomedical Only):\n"
+                    f"\n> Ref {i} (Cosine: {score_display}):\n"
                     f"Description: {d.strip()}"
                 )
                 func_text_list.append(entry)
@@ -574,23 +587,47 @@ def get_smiles_from_card(card_str: str) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 def compute_fingerprints(id2card: Dict[str, str]) -> Dict[str, Any]:
-    """Pre-computes Morgan Fingerprints for the dataset."""
+    """
+    Pre-computes Morgan Fingerprints with robust error handling.
+    Recovers molecules that fail strict RDKit sanitization.
+    """
     id2fp = {}
+    count = 0
     for nid, card in tqdm(id2card.items(), desc="Computing Fingerprints"):
         smiles = get_smiles_from_card(card)
         if smiles:
+            # Attempt 1: Standard Load
             mol = Chem.MolFromSmiles(smiles)
+            
+            # Attempt 2: Robust Load (if standard fails)
+            if mol is None:
+                mol = Chem.MolFromSmiles(smiles, sanitize=False)
+                if mol:
+                    try:
+                        mol.UpdatePropertyCache(strict=False)
+                        Chem.GetSymmSSSR(mol) # Perception of rings
+                    except:
+                        mol = None
+
+            # Generate FP if we have a mol
             if mol:
-                # Radius 2 (ECFP4), 2048 bits
-                id2fp[nid] = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+                try:
+                    # Radius 2 (ECFP4), 2048 bits
+                    id2fp[nid] = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+                except:
+                    id2fp[nid] = None
+                    count += 1
             else:
                 id2fp[nid] = None
+                count += 1
         else:
             id2fp[nid] = None
+            count += 1
+    print("Frac None", count / len(id2fp))
     return id2fp
 
 # --------------------------------------------------------------------------------------
-# Updated KNN Builder (Hybrid Retrieval)
+# Updated KNN Builder (Hybrid Retrieval + Crash Fix + Debug Print)
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def build_knn_prompt_dataset(
@@ -614,23 +651,19 @@ def build_knn_prompt_dataset(
     else:
         tokenizer = tokenizer_or_path
         
-    # Load Semantic Embeddings (GNN)
     train_id2emb = load_id2emb(train_emb_csv)
     train_ids = list(train_id2emb.keys())
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
 
-    # Load Text Data
     train_id2desc = load_descriptions_from_graphs(train_graphs)
     train_id2card = load_mol_cards_from_graphs(train_graphs)
 
-    # --- 2. Phase 1: Semantic Retrieval (GNN) ---
     print("Phase 1: Computing GNN Embeddings...")
     train_gnn_embs, train_ids_ordered = encode_graphs(gnn_model, train_graphs, device=device, batch_size=encode_batch_size)
 
-    id_to_idx = {tid: idx for idx, tid in enumerate(train_ids)} # Map ID -> DB Index
+    id_to_idx = {tid: idx for idx, tid in enumerate(train_ids)} 
 
-    # Create Mask for Leave-One-Out
     mask_self = None
     if leave_one_out:
         n_q = len(train_ids_ordered)
@@ -641,32 +674,30 @@ def build_knn_prompt_dataset(
             if j is not None:
                 mask_self[i, j] = True
 
-    # Get GNN Neighbors (we get more than needed to filter later)
-    # We want at least 1-2 functional neighbors
-    top_idx_gnn, top_sims_gnn = knn_topk(train_gnn_embs, train_embs, k=k, mask_self=mask_self)
+    # Retrieve slightly more GNN neighbors than K to handle overlap filtering
+    top_idx_gnn, top_sims_gnn = knn_topk(train_gnn_embs, train_embs, k=k+5, mask_self=mask_self)
+    ref_threshold = thresholds[1]
     top_idx_gnn = top_idx_gnn.cpu().tolist()
-    
-    # --- 3. Phase 2: Structural Retrieval (Tanimoto) ---
+    top_sims_gnn = top_sims_gnn.cpu().tolist()
+
     print("Phase 2: Computing Tanimoto Neighborhoods...")
-    
-    # Pre-compute fingerprints for Database (train_ids) and Queries (train_ids_ordered)
-    # Note: If train_graphs == train_emb_csv content, these sets overlap.
     db_fps_dict = compute_fingerprints(train_id2card)
     
-    # Convert DB FPs to a list aligned with train_ids
-    db_fps_list = [db_fps_dict.get(tid) for tid in train_ids]
+    empty_fp = DataStructs.ExplicitBitVect(2048)
+    safe_db_fps_list = []
+    for tid in train_ids:
+        fp = db_fps_dict.get(tid)
+        safe_db_fps_list.append(fp if fp is not None else empty_fp)
     
-    # Prepare Result Lists
     prompts: List[List[Dict[str, str]]] = []
     references: List[str] = []
 
-    # Caches
     desc_cache = TokenLengthCache(tokenizer, train_id2desc, f"{desc_key} Descriptions")
     card_cache = TokenLengthCache(tokenizer, train_id2card, f"{desc_key} Cards")
     
-    # Defined Ratio: 4 Structural, 1 Functional (for K=5)
-    k_struct = max(1, int(k * 0.8))
-    k_func = k - k_struct
+    # Ratios
+    k_struct = max(1, int(k * 0.8)) 
+    k_func = max(1, k - k_struct)
 
     n = len(train_ids_ordered)
     if max_samples is not None:
@@ -674,30 +705,29 @@ def build_knn_prompt_dataset(
 
     for i in tqdm(range(n), desc="Building Hybrid Prompts"):
         qid = train_ids_ordered[i]
-        q_fp = db_fps_dict.get(qid) # Query FP
+        q_fp = db_fps_dict.get(qid)
         
         # --- A. Retrieve Structural Neighbors (Tanimoto) ---
         struct_neighbors = []
         if q_fp is not None:
-            # Efficient Bulk Calc
-            t_sims = DataStructs.BulkTanimotoSimilarity(q_fp, db_fps_list)
+            t_sims = DataStructs.BulkTanimotoSimilarity(q_fp, safe_db_fps_list)
             
-            # Mask self if needed
             if leave_one_out:
                 self_idx = id_to_idx.get(qid, -1)
                 if self_idx >= 0:
                     t_sims[self_idx] = -1.0
             
-            # Get Top K indices (using numpy argpartition for speed or argsort)
-            # We need indices of the top k_struct
             t_sims_np = np.array(t_sims)
-            # argsort is ascending, take last k_struct
+            # Get Candidates
             top_struct_indices = np.argsort(t_sims_np)[-k_struct:][::-1]
             
-            for idx in top_struct_indices:
+            for rank, idx in enumerate(top_struct_indices):
                 score = t_sims_np[idx]
-                if score > 0.5:
-                    nid = train_ids[idx]
+                nid = train_ids[idx]
+                
+                # FORCE INCLUSION for the absolute best match (Rank 0)
+                # FILTER others by threshold 0.5
+                if rank == 0 or score > 0.5:
                     struct_neighbors.append({
                         "id": nid,
                         "desc": train_id2desc.get(nid, ""),
@@ -708,29 +738,45 @@ def build_knn_prompt_dataset(
         
         # --- B. Retrieve Functional Neighbors (GNN) ---
         func_neighbors = []
-        gnn_indices = top_idx_gnn[i] # Pre-computed list of indices
+        gnn_indices = top_idx_gnn[i]
+        sim_neighbors = top_sims_gnn[i]
         
-        # Avoid Duplicates: Don't pick a neighbor as Functional if it's already in Structural
         struct_nids = set(n['id'] for n in struct_neighbors)
         
-        for idx in gnn_indices:
+        # First pass: try to find good matches
+        for j, idx in enumerate(gnn_indices):
             if len(func_neighbors) >= k_func:
                 break
-            
             nid = train_ids[idx]
-            if nid not in struct_nids:
+            score = sim_neighbors[j]
+            
+            # Normal logic: score >= threshold
+            if nid not in struct_nids and score >= ref_threshold:
                 func_neighbors.append({
                     "id": nid,
                     "desc": train_id2desc.get(nid, ""),
-                    "card": train_id2card.get(nid, ""), # We might hide this later
-                    "score": 0.0, # Placeholder, GNN score not strictly comparable
+                    "card": train_id2card.get(nid, ""), 
+                    "score": score, 
                     "type": "FUNCTIONAL"
                 })
 
+        # FALLBACK: If no functional neighbors found (because all were < threshold),
+        # force the best non-structural one from the list.
+        if not func_neighbors:
+            for j, idx in enumerate(gnn_indices):
+                nid = train_ids[idx]
+                score = sim_neighbors[j]
+                if nid not in struct_nids:
+                    func_neighbors.append({
+                        "id": nid,
+                        "desc": train_id2desc.get(nid, ""),
+                        "card": train_id2card.get(nid, ""), 
+                        "score": score, 
+                        "type": "FUNCTIONAL"
+                    })
+                    break # Only add one forced fallback
+
         # --- C. Construct Hybrid Prompt ---
-        # Merge lists (Structure First)
-        # We pass them to the prompter
-        
         query_card = train_id2card.get(qid, "")
         
         smart_prompt_text = fit_neighbors_fast(
@@ -1261,12 +1307,8 @@ def generate_desc(
     evaluate: bool = False,
     ) -> pd.DataFrame:
     
-    # ----------------------------
-    # 1. Setup Model (Optimization: TF32 & BF16)
-    # ----------------------------
     print(f"Loading LLM and Tokenizer from {llm_dir_or_name}...")
     
-    # Auto-detect context length (reusing helper from your script)
     try:
         model_max_length = get_safe_context_length(llm_dir_or_name, cap=max_length)
     except NameError:
@@ -1277,17 +1319,12 @@ def generate_desc(
     
     config = AutoConfig.from_pretrained(llm_dir_or_name)
     is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
-    
-    # T5 (Seq2Seq) uses Right Padding for encoder; GPT (Causal) uses Left Padding
     tokenizer.padding_side = "right" if is_seq2seq else "left"
 
-    # Dtype Selection
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16
-        print("Using bfloat16 for generation.")
     elif torch.cuda.is_available():
         dtype = torch.float16
-        print("Using float16 for generation.")
     else:
         dtype = torch.float32
 
@@ -1295,23 +1332,17 @@ def generate_desc(
     llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto")
     llm.eval()
     
-    # Compile model for ~20% speedup on modern PyTorch (Linux only, usually)
     if hasattr(torch, "compile") and os.name != "nt":
         try:
-            print("Compiling model with torch.compile...")
             llm = torch.compile(llm)
         except Exception:
-            print("Could not compile model (skipping optimization).")
+            pass
 
-    # ----------------------------
-    # 2. Retrieval Phase (Standard)
-    # ----------------------------
-    # (Assuming helper functions exist in your scope)
+    print("Loading Data & Caches...")
     train_id2desc = load_descriptions_from_graphs(train_graphs)
     train_id2card = load_mol_cards_from_graphs(train_graphs)
     query_id2card = load_mol_cards_from_graphs(query_graphs)
 
-    # Initialize Caches for Speed (from previous optimization)
     desc_cache = TokenLengthCache(tokenizer, train_id2desc, "Train Descriptions")
     card_cache = TokenLengthCache(tokenizer, train_id2card, "Train Cards")
 
@@ -1320,76 +1351,123 @@ def generate_desc(
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
 
-    print("Encoding query..")
+    print("Phase 1: Computing Query GNN Embeddings...")
     query_embs, query_ids = encode_graphs(gnn_model, query_graphs, device=device, batch_size=encode_batch_size)
+    
+    print(f"Retrieving Semantic Neighbors (k={k} candidate pool)...")
+    top_idx_gnn, top_sims_gnn = knn_topk(query_embs, train_embs, k=k+5)
+    ref_threshold = thresholds[1]
+    top_sims_gnn = top_sims_gnn.cpu().tolist()
+    top_idx_gnn = top_idx_gnn.cpu().tolist()
+    
+    print("Phase 2: Computing Fingerprints & Structural Neighbors...")
+    db_fps_dict = compute_fingerprints(train_id2card)
+    empty_fp = DataStructs.ExplicitBitVect(2048)
+    safe_db_fps = [db_fps_dict.get(tid) if db_fps_dict.get(tid) else empty_fp for tid in train_ids]
+    query_fps_dict = compute_fingerprints(query_id2card)
 
-    print(f"Retrieving top {k} neighbors..")
-    top_idx, top_sims = knn_topk(query_embs, train_embs, k=k)
-    # thresholds = compute_similarity_thresholds(top_sims) Now using passed thresholds
-    top_idx = top_idx.cpu().tolist()
-    top_sims = top_sims.cpu().tolist()
-
-    # ----------------------------
-    # 3. Prompt Construction
-    # ----------------------------
-    # We store tuples: (length, prompt_text, qid, nn_ids, sims)
     data_buffer = []
 
-    print("Building prompts...")
+    k_struct = max(1, int(k * 0.8))
+    k_func = max(1, k - k_struct)
+
+    print("Building Hybrid Prompts...")
     for i in tqdm(range(len(query_ids)), desc="Constructing"):
         qid = query_ids[i]
-        nn_ids = [train_ids[j] for j in top_idx[i]]
-        nn_descs = [train_id2desc.get(nid, "") for nid in nn_ids]
-        nn_cards = [train_id2card.get(nid, "") for nid in nn_ids]
+        q_fp = query_fps_dict.get(qid)
+        
+        # --- A. Retrieve Structural Neighbors ---
+        struct_neighbors = []
+        if q_fp:
+            t_sims = DataStructs.BulkTanimotoSimilarity(q_fp, safe_db_fps)
+            t_sims_np = np.array(t_sims)
+            
+            top_struct_indices = np.argsort(t_sims_np)[-k_struct:][::-1]
+            
+            for rank, idx in enumerate(top_struct_indices):
+                score = t_sims_np[idx]
+                nid = train_ids[idx]
+                
+                # FORCE INCLUSION of best match (Rank 0), Filter rest
+                if rank == 0 or score > 0.5: 
+                    struct_neighbors.append({
+                        "id": nid, 
+                        "desc": train_id2desc.get(nid, ""), 
+                        "card": train_id2card.get(nid, ""), 
+                        "score": score, 
+                        "type": "STRUCTURAL"
+                    })
+        
+        # --- B. Retrieve Functional Neighbors ---
+        func_neighbors = []
+        struct_nids = set(n['id'] for n in struct_neighbors)
+        
+        gnn_candidates = top_idx_gnn[i]
+        gnn_scores = top_sims_gnn[i]
+
+        # 1. Try adding high quality matches
+        for j, idx in enumerate(gnn_candidates):
+            if len(func_neighbors) >= k_func: 
+                break
+            nid = train_ids[idx]
+            score = gnn_scores[j]
+            
+            if nid not in struct_nids and score >= ref_threshold:
+                func_neighbors.append({
+                    "id": nid, 
+                    "desc": train_id2desc.get(nid, ""), 
+                    "card": train_id2card.get(nid, ""), 
+                    "score": score, 
+                    "type": "FUNCTIONAL"
+                })
+
+        # 2. FALLBACK: If empty, force the best non-structural match
+        if not func_neighbors:
+             for j, idx in enumerate(gnn_candidates):
+                nid = train_ids[idx]
+                score = gnn_scores[j]
+                if nid not in struct_nids:
+                    func_neighbors.append({
+                        "id": nid, 
+                        "desc": train_id2desc.get(nid, ""), 
+                        "card": train_id2card.get(nid, ""), 
+                        "score": score, 
+                        "type": "FUNCTIONAL"
+                    })
+                    break 
+
+        # --- C. Call Prompt Builder ---
         query_card = query_id2card.get(qid, "")
         
-        current_sims = top_sims[i]
-        neighbor_tags = [get_closeness_tag(s, thresholds) for s in current_sims]
-
-        # Use the optimized prompt builder
         smart_prompt = fit_neighbors_fast(
             tokenizer=tokenizer,
             query_card=query_card,
-            neighbor_ids=nn_ids,
-            neighbor_descs=nn_descs,
-            neighbor_cards=nn_cards,
-            neighbor_tags=neighbor_tags,
+            struct_neighbors=struct_neighbors,
+            func_neighbors=func_neighbors,
             desc_cache=desc_cache,
             card_cache=card_cache,
             max_length=model_max_length
         )
         
-        # Estimate length for sorting (just string length is a good enough proxy for speed)
         data_buffer.append({
             "len": len(smart_prompt), 
             "prompt": smart_prompt,
             "id": qid,
-            "nn_ids": nn_ids,
-            "sims": current_sims
+            "nn_ids": [n['id'] for n in struct_neighbors + func_neighbors],
         })
 
-    # ----------------------------
-    # 4. OPTIMIZATION: Sort by Length
-    # ----------------------------
-    # Sorting groups short prompts with short, long with long. 
-    # This drastically reduces padding overhead in batches.
-    print("Sorting data by prompt length to optimize batch padding...")
+    print("Sorting data by prompt length (Batch Padding Optimization)...")
     data_buffer.sort(key=lambda x: x["len"])
-    
     sorted_prompts = [x["prompt"] for x in data_buffer]
     sorted_ids = [x["id"] for x in data_buffer]
     sorted_nn_ids = [x["nn_ids"] for x in data_buffer]
-    sorted_sims = [x["sims"] for x in data_buffer]
 
-    # ----------------------------
-    # 5. Batch Generation
-    # ----------------------------
-    print(f"Generating with Batch Size {gen_batch_size} (Greedy/Sampling, No Beams)...")
+    print(f"Generating with Batch Size {gen_batch_size}...")
     
     gen_cfg = GenerationConfig(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,       
-        num_beams=1,  # <--- CRITICAL: Disable Beam Search for speed
+        num_beams=1,
         temperature=temperature,
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
@@ -1397,14 +1475,11 @@ def generate_desc(
         decoder_start_token_id=llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id
     )
 
-    use_chat_template = bool(hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None))
     generations = []
+    use_chat_template = bool(hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None))
 
-    # Iterate through the SORTED list
     for start in tqdm(range(0, len(sorted_prompts), gen_batch_size), desc="Generating"):
         batch_prompts = sorted_prompts[start : start + gen_batch_size]
-        
-        # Ensure left-truncation if we somehow exceed limits (unlikely with sorting + pre-check)
         tokenizer.truncation_side = 'left' 
 
         if use_chat_template:
@@ -1433,58 +1508,39 @@ def generate_desc(
 
         with torch.no_grad():
             outputs = llm.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                generation_config=gen_cfg,
-                use_cache=True 
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
+                generation_config=gen_cfg, 
+                use_cache=True
             )
 
         if is_seq2seq:
             texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         else:
-            # For CausalLM, slice off input
             gen_only = outputs[:, input_ids.shape[1] :]
             texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
         
         generations.extend([t.strip() for t in texts])
 
-    # ----------------------------
-    # 6. Re-align & Save
-    # ----------------------------
-    # The generations are currently in "Length-Sorted" order. 
-    # We can save them as is, just keeping the IDs aligned.
-    
     rows = []
     for i in range(len(sorted_ids)):
-        row = { 
-            "ID": sorted_ids[i], 
-            "Prompt": sorted_prompts[i], 
-            "generated_description": generations[i] 
-        }
-        for j in range(len(sorted_nn_ids[i])):
-            row[f"NN{j+1}"] = sorted_nn_ids[i][j]
-            row[f"SIM{j+1}"] = sorted_sims[i][j]
+        row = { "ID": sorted_ids[i], "Prompt": sorted_prompts[i], "generated_description": generations[i] }
+        for j, nid in enumerate(sorted_nn_ids[i]):
+            row[f"NN{j+1}"] = nid
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    # Optional: Sort back by ID if you prefer original order
-    # df = df.sort_values(by="ID") 
-    
     os.makedirs(str(Path(out_csv).parent), exist_ok=True)
     df.to_csv(out_csv, index=False)
-    print(f"Saved full dataframe generations to: {out_csv}")
-
+    
     eval_df = df[["ID", "generated_description"]].rename(columns={"generated_description": "description"})
     submit_out_csv = out_csv.replace(".csv", "_submit.csv")
     eval_df.to_csv(submit_out_csv, index=False)
-    print(f"Saved submission generations to: {submit_out_csv}")
-
+    
     if evaluate and _EVAL_AVAILABLE:
-        # Load descriptions for evaluation
-        print("Running evaluation metrics...")
+        print("Evaluating...")
         query_id2desc = load_descriptions_from_graphs(query_graphs)
         metrics_path = str(Path(out_csv).with_suffix(".metrics.json"))
-
         evaluate_retrieval_text_metrics(
             results_df=eval_df, 
             test_id2desc=query_id2desc, 
@@ -1628,8 +1684,7 @@ def main():
                 device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
                 tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
                 max_prompt_length=context_len, 
-                # We don't need leave_one_out for validation since val graphs aren't in the train DB
-                leave_one_out=False, desc_key="Val",
+                leave_one_out=True, desc_key="Val",
             )
         
         print("Optimizing memory for SFT...")

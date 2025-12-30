@@ -171,13 +171,15 @@ def evaluate_retrieval_text_metrics(
     print(f"BERTScore F1: {metrics['bertscore_f1']:.4f}  (Scale 0-1)")
     print("-" * 80)
     print(f"Final Proxy:  {metrics['final_proxy']:.4f}  (Avg of Norm-BLEU & BERT-F1)")
+    print("-" * 80)
+    print(f"Kaggle Proxy:  ~{0.925*metrics['final_proxy']:.4f} (0.925 * Val Proxy)")
     print("=" * 80 + "\n")
 
     # Optional: Print an example for manual inspection
     if len(preds) > 0:
         print("Example Prediction:")
-        print(f"PRED: {preds[0][:200]}")
-        print(f"REF : {refs[0][:200]}\n")
+        print(f"PRED: {preds[0]}")
+        print(f"REF : {refs[0]}\n")
 
     if save_path is not None:
         with open(save_path, "w", encoding="utf-8") as f:
