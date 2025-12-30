@@ -1,5 +1,5 @@
 import os
-
+import argparse
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -8,111 +8,92 @@ from torch.utils.data import DataLoader
 from data_utils import (
     load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
 )
-
-from train_gcn import (
-    MolGNN, DEVICE, TRAIN_GRAPHS, TEST_GRAPHS, TRAIN_EMB_CSV
-)
+from models_gps import MolGPS
 
 
 @torch.no_grad()
-def retrieve_descriptions(model, train_data, test_data, train_emb_dict, device, output_csv):
-    """
-    Args:
-        model: Trained GNN model
-        train_data: Path to train preprocessed graphs
-        test_data: Path to test preprocessed graphs
-        train_emb_dict: Dictionary mapping train IDs to text embeddings
-        device: Device to run on
-        output_csv: Path to save retrieved descriptions
-    """
-    train_id2desc = load_descriptions_from_graphs(train_data)
-    
+def retrieve_descriptions(model, train_graphs_pkl, test_graphs_pkl, train_emb_csv, device, output_csv):
+    train_id2desc = load_descriptions_from_graphs(train_graphs_pkl)
+
+    train_emb_dict = load_id2emb(train_emb_csv)
     train_ids = list(train_emb_dict.keys())
-    train_embs = torch.stack([train_emb_dict[id_] for id_ in train_ids]).to(device)
+    train_embs = torch.stack([train_emb_dict[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
-    
-    print(f"Train set size: {len(train_ids)}")
-    
-    test_ds = PreprocessedGraphDataset(test_data)
+
+    test_ds = PreprocessedGraphDataset(test_graphs_pkl)
     test_dl = DataLoader(test_ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
-    
-    print(f"Test set size: {len(test_ds)}")
-    
+
     test_mol_embs = []
     test_ids_ordered = []
     for graphs in test_dl:
         graphs = graphs.to(device)
         mol_emb = model(graphs)
         test_mol_embs.append(mol_emb)
-        batch_size = graphs.num_graphs
-        start_idx = len(test_ids_ordered)
-        test_ids_ordered.extend(test_ds.ids[start_idx:start_idx + batch_size])
-    
+
+        bs = graphs.num_graphs
+        start = len(test_ids_ordered)
+        test_ids_ordered.extend(test_ds.ids[start:start + bs])
+
     test_mol_embs = torch.cat(test_mol_embs, dim=0)
-    print(f"Encoded {test_mol_embs.size(0)} test molecules")
-    
-    similarities = test_mol_embs @ train_embs.t()
-    
-    most_similar_indices = similarities.argmax(dim=-1).cpu()
-    
+    sims = test_mol_embs @ train_embs.t()
+    idx = sims.argmax(dim=-1).cpu()
+
     results = []
     for i, test_id in enumerate(test_ids_ordered):
-        train_idx = most_similar_indices[i].item()
+        train_idx = idx[i].item()
         retrieved_train_id = train_ids[train_idx]
         retrieved_desc = train_id2desc[retrieved_train_id]
-        
-        results.append({
-            'ID': test_id,
-            'description': retrieved_desc
-        })
-        
-        if i < 5:
-            print(f"\nTest ID {test_id}: Retrieved from train ID {retrieved_train_id}")
-            print(f"Description: {retrieved_desc[:150]}...")
-    
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(output_csv, index=False)
-    print(f"\n{'='*80}")
-    print(f"Saved {len(results)} retrieved descriptions to: {output_csv}")
-    
-    return results_df
+        results.append({"ID": test_id, "description": retrieved_desc})
+
+    df = pd.DataFrame(results)
+    df.to_csv(output_csv, index=False)
+    print(f"✅ Saved: {output_csv} ({len(df)} rows)")
 
 
 def main():
-    print(f"Device: {DEVICE}")
-    
-    output_csv = "test_retrieved_descriptions.csv"
-    
-    model_path = "model_checkpoint.pt"
-    if not os.path.exists(model_path):
-        print(f"Error: Model checkpoint '{model_path}' not found.")
-        print("Please train a model first using train_gcn.py")
-        return
-    
-    if not os.path.exists(TEST_GRAPHS):
-        print(f"Error: Preprocessed graphs not found at {TEST_GRAPHS}")
-        return
-    
-    train_emb = load_id2emb(TRAIN_EMB_CSV)
-    
-    emb_dim = len(next(iter(train_emb.values())))
-    
-    model = MolGNN(out_dim=emb_dim).to(DEVICE)
-    print(f"Loading model from {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--train_graphs", type=str, default="data/train_graphs.pkl")
+    ap.add_argument("--test_graphs", type=str, default="data/test_graphs.pkl")
+    ap.add_argument("--train_emb_csv", type=str, required=True)
+    ap.add_argument("--ckpt", type=str, required=True)
+    ap.add_argument("--output_csv", type=str, default="test_retrieved_descriptions.csv")
+
+    ap.add_argument("--hidden_dim", type=int, default=256)
+    ap.add_argument("--num_layers", type=int, default=4)
+    ap.add_argument("--num_heads", type=int, default=4)
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--attn_type", type=str, default="multihead")
+    args = ap.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+
+    if not os.path.exists(args.ckpt):
+        raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
+
+    emb_dim = len(next(iter(load_id2emb(args.train_emb_csv).values())))
+
+    model = MolGPS(
+        hidden_dim=args.hidden_dim,
+        out_dim=emb_dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        dropout=args.dropout,
+        attn_type=args.attn_type,
+    ).to(device)
+
+    model.load_state_dict(torch.load(args.ckpt, map_location=device))
     model.eval()
-    
+
     retrieve_descriptions(
         model=model,
-        train_data=TRAIN_GRAPHS,
-        test_data=TEST_GRAPHS,
-        train_emb_dict=train_emb,
-        device=DEVICE,
-        output_csv=output_csv
+        train_graphs_pkl=args.train_graphs,
+        test_graphs_pkl=args.test_graphs,
+        train_emb_csv=args.train_emb_csv,
+        device=device,
+        output_csv=args.output_csv,
     )
-    
 
 
 if __name__ == "__main__":
     main()
-
