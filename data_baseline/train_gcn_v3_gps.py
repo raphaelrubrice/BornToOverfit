@@ -134,15 +134,28 @@ class MolGNN_GPS(nn.Module):
 # =========================================================
 # Training and Evaluation
 # =========================================================
-def train_epoch(mol_enc, loader, optimizer, device):
+def clip_infonce_loss(mol_vec, txt_vec, temperature=0.07):
+    # mol_vec, txt_vec already normalized
+    logits = (txt_vec @ mol_vec.t()) / temperature  # [B,B]
+    labels = torch.arange(logits.size(0), device=logits.device)
+
+    loss_t2m = F.cross_entropy(logits, labels)
+    loss_m2t = F.cross_entropy(logits.t(), labels)
+    return 0.5 * (loss_t2m + loss_m2t)
+
+def train_epoch(mol_enc, loader, optimizer, device, loss_func='mse', loss_kwargs={}):
     mol_enc.train()
     total_loss, total = 0.0, 0
+
+    print(f"\nUsing {loss_func.upper()} loss")
+    loss_func = F.mse_loss if loss_func == 'mse' else clip_infonce_loss
+    
     for graphs, text_emb in loader:
         graphs, text_emb = graphs.to(device), text_emb.to(device)
         mol_vec = mol_enc(graphs)
         txt_vec = F.normalize(text_emb, dim=-1)
         
-        loss = F.mse_loss(mol_vec, txt_vec)
+        loss = loss_func(mol_vec, txt_vec, **loss_kwargs)
         
         optimizer.zero_grad()
         loss.backward()
@@ -227,7 +240,9 @@ def load_molgnn_gps_from_checkpoint(
 
     return gnn
 
-def main(data_folder, output_folder):
+def main(data_folder, output_folder, loss_func):
+    loss_func = loss_func.lower()
+
     # Setup Paths
     file_path = Path(os.path.abspath(__file__))
     parent_folder = file_path.parent
@@ -283,7 +298,7 @@ def main(data_folder, output_folder):
 
     # Training Loop
     for ep in range(EPOCHS):
-        loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
+        loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE, loss=loss_func)
         val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE, dl=val_dl) if val_emb else {}
         
         str_val = " | ".join([f"{k}: {v:.4f}" for k, v in val_scores.items()])
@@ -338,6 +353,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
+    parser.add_argument("-loss", default="mse", type=str)
 
     args = parser.parse_args()
-    main(data_folder=args.f_data, output_folder=args.f)
+    main(data_folder=args.f_data, output_folder=args.f, loss=args.loss)
