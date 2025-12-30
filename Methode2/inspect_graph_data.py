@@ -1,5 +1,7 @@
+
 import os
 import pickle
+from pathlib import Path
 
 
 def inspect_graph_file(pkl_path, num_samples=3):
@@ -74,7 +76,10 @@ def inspect_graph_file(pkl_path, num_samples=3):
 
 
 def main():
-    base_path = "data"
+    file_path = Path(os.path.abspath(__file__))
+    parent_folder = file_path.parent
+
+    base_path = str(parent_folder / "data")
     splits = ["train", "validation", "test"]
     
     print("=" * 100)
@@ -94,4 +99,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
