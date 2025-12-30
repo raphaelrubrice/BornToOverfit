@@ -32,6 +32,7 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     GenerationConfig,
     Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
     Trainer,
     TrainingArguments,
     TrainerCallback,
@@ -532,6 +533,7 @@ def build_knn_prompt_dataset(
     max_prompt_length: int = 1024,
     max_samples: Optional[int] = None,
     leave_one_out: bool = True,
+    desc_key="Train",
 ) -> Dataset:
     
     if isinstance(tokenizer_or_path, str):
@@ -548,8 +550,8 @@ def build_knn_prompt_dataset(
     train_id2card = load_mol_cards_from_graphs(train_graphs)
 
     # --- Prepare Cache ---
-    desc_cache = TokenLengthCache(tokenizer, train_id2desc, "Train Descriptions")
-    card_cache = TokenLengthCache(tokenizer, train_id2card, "Train Cards")
+    desc_cache = TokenLengthCache(tokenizer, train_id2desc, f"{desc_key} Descriptions")
+    card_cache = TokenLengthCache(tokenizer, train_id2card, f"{desc_key} Cards")
 
     train_gnn_embs, train_ids_ordered = encode_graphs(gnn_model, train_graphs, device=device, batch_size=encode_batch_size)
 
@@ -617,6 +619,55 @@ def _render_prompt_for_sft(tokenizer, prompt_messages: List[Dict[str, str]]) -> 
     parts.append("ASSISTANT:")
     return "\n".join(parts)
 
+class CausalSeq2SeqTrainer(Seq2SeqTrainer):
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        """
+        Custom prediction step for Causal LMs (Decoder-Only) in Seq2SeqTrainer.
+        Strips 'labels' to prevent shape mismatch errors in .generate(), 
+        but preserves them for metrics.
+        """
+        if prediction_loss_only:
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+
+        # 1. Separate Labels from Inputs
+        # Causal models crash if 'labels' are passed to .generate() alongside input_ids
+        has_labels = "labels" in inputs
+        inputs_no_labels = {k: v for k, v in inputs.items() if k != "labels"}
+
+        with torch.no_grad():
+            # 2. Generate
+            # We rely on model.generation_config (which we configured in sft_finetune_on_knn)
+            # to handle max_new_tokens, etc. No need to pull from self.args.
+            generated_tokens = model.generate(**inputs_no_labels)
+            
+            # Handle case where generate returns a dict (unlikely here, but safe)
+            if isinstance(generated_tokens, dict):
+                generated_tokens = generated_tokens["sequences"]
+
+            # 3. Restore Labels for Metrics
+            if has_labels:
+                labels = inputs["labels"]
+            else:
+                labels = None
+
+            # 4. Pad if necessary
+            # The Trainer loop expects all batches to have the same tensor width to stack them.
+            if labels is not None:
+                # We use the 'generation_max_length' we explicitly passed to TrainingArguments
+                # This corresponds to 'safe_max_total_len' from our main function.
+                max_len = self.args.generation_max_length
+                
+                # Fallback just in case
+                if max_len is None:
+                    max_len = model.generation_config.max_length
+
+                if max_len is not None and generated_tokens.shape[-1] < max_len:
+                     generated_tokens = self._pad_tensors_to_max_len(generated_tokens, max_len)
+                
+        # Return tuple: (loss, logits, labels)
+        # Loss is None because we are evaluating generation, not perplexity here
+        return (None, generated_tokens, labels)
+    
 def sft_finetune_on_knn(
     base_model_name_or_path: str,
     output_dir: str,
@@ -643,6 +694,11 @@ def sft_finetune_on_knn(
     os.makedirs(output_dir, exist_ok=True)
     config = AutoConfig.from_pretrained(base_model_name_or_path)
 
+    # We need a max_length that is an INT (for the Trainer) 
+    # but large enough to fit the Prompt + Generation (to avoid crashes).
+    safe_max_total_len = max_prompt_length + max_completion_length
+    print(f"Setting generation max_length to: {safe_max_total_len} (Prompt: {max_prompt_length} + Gen: {max_completion_length})")
+
     # Determine standard floating point type based on arguments and hardware
     if bf16:
         dtype = torch.bfloat16
@@ -660,7 +716,6 @@ def sft_finetune_on_knn(
 
     # Set default patience for Early Stopping
     if patience is None:
-        # Defaults to 5 or 5% of training steps, whichever is smaller
         patience = min(5, int(0.05 * num_train_steps))
 
     # Initialize Model
@@ -676,6 +731,15 @@ def sft_finetune_on_knn(
     )
     model.gradient_checkpointing_enable()
 
+    if model.generation_config is None:
+        model.generation_config = GenerationConfig.from_pretrained(base_model_name_or_path)
+    
+    # 1. Limit the NEW tokens generated
+    model.generation_config.max_new_tokens = max_completion_length
+
+    # 2. Set the TOTAL limit (Prompt + New) to our safe integer
+    model.generation_config.max_length = safe_max_total_len
+
     # Initialize Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_name_or_path,
@@ -689,9 +753,6 @@ def sft_finetune_on_knn(
     if config.is_encoder_decoder:
         tokenizer.padding_side = "right"
     else:
-        # Causal models usually need left padding for generation, 
-        # but right padding is often standard for training. 
-        # Seq2SeqTrainer handles this, but "left" is safer for batched generation.
         tokenizer.padding_side = "left"
 
     # Configure LoRA
@@ -722,8 +783,6 @@ def sft_finetune_on_knn(
         ref = ex["reference"] or ""
         prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
 
-        # CASE 1: Encoder-Decoder OR Evaluation (Generation) Mode
-        # We separate inputs and labels so `predict_with_generate` works correctly.
         if config.is_encoder_decoder or is_eval:
             model_inputs = tokenizer(
                 prompt_text,
@@ -738,8 +797,7 @@ def sft_finetune_on_knn(
             model_inputs["labels"] = labels
             return model_inputs
 
-        # CASE 2: CausalLM Training (Standard)
-        # We concatenate Prompt + Response and mask the prompt in the labels.
+        # CausalLM Training
         full_text = prompt_text + " " + ref + tokenizer.eos_token
         full = tokenizer(
             full_text,
@@ -751,7 +809,6 @@ def sft_finetune_on_knn(
         input_ids = full["input_ids"]
         labels = input_ids.copy()
 
-        # Determine prompt length to mask it
         prompt_ids = tokenizer(
             prompt_text,
             max_length=max_prompt_length,
@@ -760,18 +817,15 @@ def sft_finetune_on_knn(
         )["input_ids"]
         
         prompt_len = len(prompt_ids)
-        # Adjust for BOS token if present
         if tokenizer.bos_token_id and input_ids[0] == tokenizer.bos_token_id:
             prompt_len += 1
 
-        # Mask the prompt part in labels using -100
         for i in range(min(prompt_len, len(labels))):
             labels[i] = -100
             
         full["labels"] = labels
         return full
 
-    # Apply tokenization
     tokenized_train = train_dataset.map(
         lambda x: _tokenize(x, is_eval=False),
         remove_columns=train_dataset.column_names
@@ -780,54 +834,32 @@ def sft_finetune_on_knn(
     tokenized_eval = None
     if eval_dataset is not None:
         print("Tokenizing validation set for Generation Metrics...")
-        # Important: is_eval=True ensures prompts and labels are split
         tokenized_eval = eval_dataset.map(
             lambda x: _tokenize(x, is_eval=True),
             remove_columns=eval_dataset.column_names
         )
 
-    # --- Compute Metrics Function (BLEU + BERTScore) ---
+    # --- Compute Metrics Function ---
     def compute_metrics(eval_preds):
         preds, labels = eval_preds
         
         if isinstance(preds, tuple):
             preds = preds[0]
 
-        # Decode generated predictions
-        decoded_preds = tokenizer.batch_decode(
-            preds,
-            skip_special_tokens=True
-        )
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
 
-        # Decode labels (replacing -100 with Pad ID)
         if isinstance(labels, np.ndarray):
-            labels = np.where(
-                labels != -100, 
-                labels, 
-                tokenizer.pad_token_id
-            )
+            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
         
-        decoded_labels = tokenizer.batch_decode(
-            labels,
-            skip_special_tokens=True
-        )
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-        # Basic Cleanup
         decoded_preds = [p.strip().lower() for p in decoded_preds]
         decoded_labels = [l.strip().lower() for l in decoded_labels]
 
-        # 1. BLEU-4
-        # sacrebleu expects: references=[[ref1, ref2, ...]]
-        bleu_res = sacrebleu.corpus_bleu(
-            decoded_preds, 
-            [decoded_labels], 
-            lowercase=True
-        )
+        bleu_res = sacrebleu.corpus_bleu(decoded_preds, [decoded_labels], lowercase=True)
         bleu4 = bleu_res.score
 
-        # 2. BERTScore
         try:
-            # Using function wrapper from bert_score
             P, R, F1 = bertscore(
                 decoded_preds,
                 decoded_labels,
@@ -842,8 +874,6 @@ def sft_finetune_on_knn(
             print(f"Warning: BERTScore computation failed: {e}")
             bert_f1 = 0.0
 
-        # 3. Final Proxy Metric
-        # Normalize BLEU (0-100) to (0-1) and average with BERTScore F1
         final_proxy = 0.5 * (bleu4 / 100.0) + 0.5 * bert_f1
 
         return {
@@ -866,18 +896,15 @@ def sft_finetune_on_knn(
     load_best = False
     metric_for_best = None
     
-    # We only set up evaluation steps if we have an eval dataset
     if tokenized_eval is not None:
         eval_strategy = "steps"
-        # Evaluate roughly 20 times over the course of training
-        eval_steps = max(20, num_train_steps // 20)
+        eval_steps = min(num_train_steps // 2, max(20, num_train_steps // 20))
         
-        # Only enable Early Stopping if explicitly requested AND we have a val set
         if use_early_stopping:
             print(f"Enabling Early Stopping (Patience={patience}) based on final_proxy...")
             callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))
             load_best = True
-            metric_for_best = "final_proxy"
+            metric_for_best = "eval_loss" # Trainer looks for "eval_final_proxy"
     else:
         eval_steps = 0
 
@@ -886,7 +913,7 @@ def sft_finetune_on_knn(
     else:
         save_strategy = "no"
 
-    args = TrainingArguments(
+    args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         max_steps=num_train_steps,
         per_device_train_batch_size=per_device_train_batch_size,
@@ -895,33 +922,40 @@ def sft_finetune_on_knn(
         learning_rate=learning_rate,
         neftune_noise_alpha=neftune_noise_alpha,
         
-        # Eval & Save Strategy
-        evaluation_strategy=eval_strategy,
+        # If using older transformers (<4.41), change this back to 'evaluation_strategy'
+        # Strategies must match for load_best_model_at_end to work
+        eval_strategy=eval_strategy,
         eval_steps=eval_steps,
         save_strategy=save_strategy,
         save_steps=eval_steps,
         save_total_limit=2,
         
-        # Early Stopping Configuration
+        # Early Stopping Config
         load_best_model_at_end=load_best,
         metric_for_best_model=metric_for_best,
-        greater_is_better=True,
+        greater_is_better=False,
         
-        # Generation Configuration for Metric Computation
-        predict_with_generate=True if tokenized_eval is not None else False,
-        generation_max_length=max_completion_length,
+        predict_with_generate=False,
+        generation_max_length=None,
         
         bf16=bf16,
         fp16=(fp16 and not bf16),
         report_to=[],
         seed=seed,
         gradient_checkpointing=True,
-        remove_unused_columns=False,
+        remove_unused_columns=False, # Essential when using custom prompts columns
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    # Use Seq2SeqTrainer to support predict_with_generate
-    trainer = Seq2SeqTrainer(
+    # 9. Dynamic Trainer Selection
+    if config.is_encoder_decoder:
+        print("Using Standard Seq2SeqTrainer (Encoder-Decoder detected)")
+        trainer_cls = Seq2SeqTrainer
+    else:
+        print("Using Custom CausalSeq2SeqTrainer (Decoder-Only detected)")
+        trainer_cls = CausalSeq2SeqTrainer
+
+    trainer = trainer_cls(
         model=model,
         args=args,
         train_dataset=tokenized_train,
@@ -929,7 +963,7 @@ def sft_finetune_on_knn(
         data_collator=data_collator,
         tokenizer=tokenizer,
         callbacks=callbacks,
-        compute_metrics=compute_metrics if tokenized_eval is not None else None
+        compute_metrics=compute_metrics if tokenized_eval else None
     )
 
     trainer.train()
@@ -1339,6 +1373,7 @@ def main():
     parser.add_argument("--sft_steps", default=800, type=int)
     parser.add_argument("--sft_lr", default=2e-5, type=float)
     parser.add_argument("--sft_early_stopping", action="store_true", help="Enable early stopping based on validation metrics")
+    parser.add_argument("--sft_patience", default=None, help="Early Stopping patience window for SFT")
     parser.add_argument("--sft_neftune", action="store_true", help="Enable NEFTune noise alpha=5")
     parser.add_argument("--sft_lora", default=128, type=int, help="LoRA rank for SFT")
 
@@ -1436,12 +1471,12 @@ def main():
             device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
             tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
             max_prompt_length=context_len, max_samples=args.max_train_samples, 
-            leave_one_out=True
+            leave_one_out=True, desc_key="Train",
         )
         
         # <--- NEW: Build Validation Dataset for Early Stopping --->
         knn_val_ds = None
-        if args.do_sft: 
+        if args.do_sft and args.sft_early_stopping: 
             print("Building KNN dataset (VAL) for Early Stopping...")
             # Note: We use VAL_GRAPHS as the "query", but still retrieve from TRAIN_EMB_CSV
             knn_val_ds = build_knn_prompt_dataset(
@@ -1452,7 +1487,7 @@ def main():
                 tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
                 max_prompt_length=context_len, 
                 # We don't need leave_one_out for validation since val graphs aren't in the train DB
-                leave_one_out=False 
+                leave_one_out=False, desc_key="Val",
             )
         
         print("Optimizing memory for SFT...")
