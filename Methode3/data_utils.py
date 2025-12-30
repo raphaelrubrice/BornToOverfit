@@ -2,7 +2,8 @@
 Data loading and processing utilities for molecule-text retrieval.
 Includes dataset classes and data loading functions.
 """
-from typing import Dict
+from typing import Dict, List, Any
+import os
 import pickle
 
 import pandas as pd
@@ -14,8 +15,6 @@ from torch_geometric.data import Batch
 # =========================================================
 # Feature maps for atom and bond attributes
 # =========================================================
-from typing import Dict, List, Any
-
 x_map: Dict[str, List[Any]] = {
     'atomic_num': list(range(0, 119)),
     'chirality': [
@@ -49,25 +48,41 @@ e_map: Dict[str, List[Any]] = {
 
 
 # =========================================================
-# Load precomputed text embeddings
+# Load precomputed text embeddings (.csv OR .pt)
 # =========================================================
-def load_id2emb(csv_path: str) -> Dict[str, torch.Tensor]:
+def load_id2emb(path: str) -> Dict[str, torch.Tensor]:
     """
-    Load precomputed text embeddings from CSV file.
-    
-    Args:
-        csv_path: Path to CSV file with columns: ID, embedding
-                  where embedding is comma-separated floats
-        
+    Load precomputed text embeddings from CSV or PT file.
+
+    CSV format:
+        columns: ID, embedding
+        embedding: comma-separated floats
+
+    PT format:
+        torch.save(dict[str, torch.Tensor], path)
+
     Returns:
-        Dictionary mapping ID (str) to embedding tensor
+        Dict[id -> embedding tensor]
     """
-    df = pd.read_csv(csv_path)
-    id2emb = {}
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Embedding file not found: {path}")
+
+    if path.endswith(".pt") or path.endswith(".pth"):
+        obj = torch.load(path, map_location="cpu")
+        if not isinstance(obj, dict):
+            raise ValueError("PT embedding file must be a dict[id -> tensor].")
+        # ensure tensor type
+        out = {}
+        for k, v in obj.items():
+            out[str(k)] = v.detach().cpu().float() if torch.is_tensor(v) else torch.tensor(v, dtype=torch.float32)
+        return out
+
+    # fallback CSV
+    df = pd.read_csv(path)
+    id2emb: Dict[str, torch.Tensor] = {}
     for _, row in df.iterrows():
         id_ = str(row["ID"])
-        emb_str = row["embedding"]
-        emb_vals = [float(x) for x in str(emb_str).split(',')]
+        emb_vals = [float(x) for x in str(row["embedding"]).split(',')]
         id2emb[id_] = torch.tensor(emb_vals, dtype=torch.float32)
     return id2emb
 
@@ -76,36 +91,15 @@ def load_id2emb(csv_path: str) -> Dict[str, torch.Tensor]:
 # Load descriptions from preprocessed graphs
 # =========================================================
 def load_descriptions_from_graphs(graph_path: str) -> Dict[str, str]:
-    """
-    Load ID to description mapping from preprocessed graph file.
-    
-    Args:
-        graph_path: Path to .pkl file containing list of pre-saved graphs
-        
-    Returns:
-        Dictionary mapping ID (str) to description (str)
-    """
     with open(graph_path, 'rb') as f:
         graphs = pickle.load(f)
-    
-    id2desc = {}
-    for graph in graphs:
-        id2desc[graph.id] = graph.description
-    
-    return id2desc
+    return {g.id: g.description for g in graphs}
 
 
 # =========================================================
 # Dataset that loads preprocessed graphs and text embeddings
 # =========================================================
 class PreprocessedGraphDataset(Dataset):
-    """
-    Dataset that loads pre-saved molecule graphs with optional text embeddings.
-    
-    Args:
-        graph_path: Path to .pkl file containing list of pre-saved graphs
-        emb_dict: Dictionary mapping ID to text embedding tensors (optional)
-    """
     def __init__(self, graph_path: str, emb_dict: Dict[str, torch.Tensor] = None):
         print(f"Loading graphs from: {graph_path}")
         with open(graph_path, 'rb') as f:
@@ -120,28 +114,14 @@ class PreprocessedGraphDataset(Dataset):
     def __getitem__(self, idx):
         graph = self.graphs[idx]
         if self.emb_dict is not None:
-            id_ = graph.id
-            text_emb = self.emb_dict[id_]
-            return graph, text_emb
-        else:
-            return graph
+            return graph, self.emb_dict[graph.id]
+        return graph
 
 
 def collate_fn(batch):
-    """
-    Collate function for DataLoader to batch graphs with optional text embeddings.
-    
-    Args:
-        batch: List of graph Data objects or (graph, text_embedding) tuples
-        
-    Returns:
-        Batched graph or (batched_graph, stacked_text_embeddings)
-    """
     if isinstance(batch[0], tuple):
         graphs, text_embs = zip(*batch)
         batch_graph = Batch.from_data_list(list(graphs))
         text_embs = torch.stack(text_embs, dim=0)
         return batch_graph, text_embs
-    else:
-        return Batch.from_data_list(batch)
-
+    return Batch.from_data_list(batch)
