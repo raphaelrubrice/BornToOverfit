@@ -356,4 +356,4 @@ if __name__ == "__main__":
     parser.add_argument("-loss", default="mse", type=str)
 
     args = parser.parse_args()
-    main(data_folder=args.f_data, output_folder=args.f, loss=args.loss)
+    main(data_folder=args.f_data, output_folder=args.f, loss_func=args.loss)
