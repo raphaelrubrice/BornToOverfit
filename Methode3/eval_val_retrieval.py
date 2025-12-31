@@ -30,7 +30,13 @@ def main():
     train_mat = F.normalize(train_mat, dim=-1)
 
     emb_dim = len(next(iter(train_emb.values())))
-    model = MolGNN(hidden_dim=HIDDEN_DIM, out_dim=emb_dim, num_layers=NUM_LAYERS, num_heads=NUM_HEADS, dropout=DROPOUT).to(DEVICE)
+    model = MolGNN(
+        hidden_dim=HIDDEN_DIM,
+        out_dim=emb_dim,
+        num_layers=NUM_LAYERS,
+        num_heads=NUM_HEADS,
+        dropout=DROPOUT,
+    ).to(DEVICE)
     model.load_state_dict(torch.load(args.ckpt, map_location=DEVICE))
     model.eval()
 
@@ -63,6 +69,8 @@ def main():
         weights=(0.25, 0.25, 0.25, 0.25),
         smoothing_function=smoothie
     )
+
+    # print only the score (easier to parse)
     print(f"{bleu4:.6f}")
 
 
