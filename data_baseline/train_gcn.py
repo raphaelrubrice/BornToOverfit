@@ -29,7 +29,7 @@ from argparse import ArgumentParser
 # MODEL: GNN to encode graphs (simple GCN, no edge features)
 # =========================================================
 class Baseline_MolGNN(nn.Module):
-    def __init__(self, hidden=128, out_dim=256, layers=3):
+    def __init__(self, hidden=128, out_dim=256, layers=3, **kwargs):
         super().__init__()
 
         # Use a single learnable embedding for all nodes (no node features)
@@ -55,7 +55,7 @@ class Baseline_MolGNN(nn.Module):
         return g
 
 class MolGNN(nn.Module):
-    def __init__(self, hidden=128, out_dim=256, layers=3, x_map=None, e_map=None):
+    def __init__(self, hidden=128, out_dim=256, layers=3, x_map=None, e_map=None, **kwargs):
         super().__init__()
         assert x_map is not None, "Pass x_map from data_utils so embedding sizes match"
         assert e_map is not None, "Pass e_map from data_utils so edge embedding sizes match"
@@ -277,7 +277,11 @@ def main(parent_folder, folder):
     val_dl = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
     # Init Model
-    mol_enc = MolGNN(out_dim=emb_dim, hidden=HIDDEN, layers=LAYERS, x_map=x_map, e_map=e_map).to(DEVICE)
+    if model == 'gine':
+        model_cls = MolGNN
+    else:
+        model_cls = Baseline_MolGNN
+    mol_enc = model_cls(out_dim=emb_dim, hidden=HIDDEN, layers=LAYERS, x_map=x_map, e_map=e_map).to(DEVICE)
     optimizer = torch.optim.Adam(mol_enc.parameters(), lr=LR)
     
     # Init Early Stopping
@@ -335,6 +339,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
+    parser.add_argument("-model", default="gine", type=str)
 
     args = parser.parse_args()
     data_folder = args.f_data
@@ -367,4 +372,4 @@ if __name__ == "__main__":
     HIDDEN = 256
     LAYERS = 3
 
-    main(parent_folder, folder)
+    main(parent_folder, folder, args.model)
