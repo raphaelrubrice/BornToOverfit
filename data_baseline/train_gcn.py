@@ -154,8 +154,11 @@ def clip_infonce_loss(mol_vec, txt_vec, temperature=0.07):
     loss_m2t = F.cross_entropy(logits.t(), labels)
     return 0.5 * (loss_t2m + loss_m2t)
 
-def train_epoch(mol_enc, loader, optimizer, device):
+def train_epoch(mol_enc, loader, optimizer, device, loss_func='mse'):
     mol_enc.train()
+
+    print(f"Using {loss_func.upper()} loss")
+    loss_func = F.mse_loss if loss_func == 'mse' else clip_infonce_loss
 
     total_loss, total = 0.0, 0
     for graphs, text_emb in loader:
@@ -165,7 +168,7 @@ def train_epoch(mol_enc, loader, optimizer, device):
         mol_vec = mol_enc(graphs)
         txt_vec = F.normalize(text_emb, dim=-1)
 
-        loss = clip_infonce_loss(mol_vec, txt_vec, temperature=0.07) #F.mse_loss(mol_vec, txt_vec)
+        loss = loss_func(mol_vec, txt_vec, temperature=0.07) #F.mse_loss(mol_vec, txt_vec)
 
         optimizer.zero_grad()
         loss.backward()
@@ -261,10 +264,10 @@ def load_molgnn_from_checkpoint(
 # =========================================================
 # Main Training Loop
 # =========================================================
-def main(parent_folder, folder, model):
+def main(parent_folder, folder, model, loss_func):
     print(f"Device: {DEVICE}")
     model = model.lower()
-    
+
     train_emb = load_id2emb(TRAIN_EMB_CSV)
     val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
 
@@ -296,7 +299,7 @@ def main(parent_folder, folder, model):
 
     # Training Loop
     for ep in range(EPOCHS):
-        train_loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
+        train_loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE, loss_func=loss_func)
         val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE, dl=val_dl)
         
         current_mrr = val_scores['MRR']
@@ -345,6 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("-model", default="gine", type=str)
+    parser.add_argument("-loss", default="mse", type=str)
 
     args = parser.parse_args()
     data_folder = args.f_data
@@ -377,4 +381,4 @@ if __name__ == "__main__":
     HIDDEN = 256
     LAYERS = 3
 
-    main(parent_folder, folder, args.model)
+    main(parent_folder, folder, args.model, args.loss)
