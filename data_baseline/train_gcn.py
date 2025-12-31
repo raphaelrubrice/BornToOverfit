@@ -168,7 +168,7 @@ def train_epoch(mol_enc, loader, optimizer, device, loss_func='mse'):
         mol_vec = mol_enc(graphs)
         txt_vec = F.normalize(text_emb, dim=-1)
 
-        loss = loss_func(mol_vec, txt_vec, temperature=0.07) #F.mse_loss(mol_vec, txt_vec)
+        loss = loss_func(mol_vec, txt_vec) #F.mse_loss(mol_vec, txt_vec)
 
         optimizer.zero_grad()
         loss.backward()
