@@ -17,7 +17,7 @@ try:
     from.train_gcn import MolGNN, Baseline_MolGNN, load_molgnn_from_checkpoint
 except:
     from data_utils import (
-    load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn
+    load_id2emb, load_descriptions_from_graphs, PreprocessedGraphDataset, collate_fn, x_map, e_map
     )
     from train_gcn import MolGNN, Baseline_MolGNN, load_molgnn_from_checkpoint
 
