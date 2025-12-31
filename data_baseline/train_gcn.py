@@ -237,10 +237,14 @@ def load_molgnn_from_checkpoint(
 
     model_class = cfg.get("model_class", "MolGNN")
 
-    if model_class != "MolGNN":
+    if model_class != "MolGNN" and model_class != "Baseline_MolGNN":
         raise ValueError(f"Unsupported GNN class: {model_class}")
 
-    gnn = MolGNN(
+    if model_class == 'MolGNN':
+        model_cls = MolGNN
+    else:
+        model_cls = Baseline_MolGNN
+    gnn = model_cls(
         hidden=cfg["hidden"],
         out_dim=cfg["out_dim"],
         layers=cfg["layers"],

@@ -289,9 +289,12 @@ def main(folder, evaluate=True):
     
     emb_dim = len(next(iter(train_emb.values())))
     
-    model = MolGNN(out_dim=emb_dim).to(DEVICE)
     print(f"Loading model from {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model = load_molgnn_from_checkpoint(model_path,
+                                DEVICE,
+                                x_map,
+                                e_map)
+    
     model.eval()
     
     retrieve_descriptions(
