@@ -257,7 +257,7 @@ def load_molgnn_from_checkpoint(
 # =========================================================
 # Main Training Loop
 # =========================================================
-def main(parent_folder, folder):
+def main(parent_folder, folder, model):
     print(f"Device: {DEVICE}")
 
     train_emb = load_id2emb(TRAIN_EMB_CSV)
