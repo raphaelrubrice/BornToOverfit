@@ -263,7 +263,8 @@ def load_molgnn_from_checkpoint(
 # =========================================================
 def main(parent_folder, folder, model):
     print(f"Device: {DEVICE}")
-
+    model = model.lower()
+    
     train_emb = load_id2emb(TRAIN_EMB_CSV)
     val_emb = load_id2emb(VAL_EMB_CSV) if os.path.exists(VAL_EMB_CSV) else None
 
@@ -323,7 +324,7 @@ def main(parent_folder, folder, model):
 
     # Save Model
     config = {
-        "model_class": "MolGNN",
+        "model_class": "MolGNN" if model == 'gine' else 'Baseline_MolGNN',
         "hidden": HIDDEN,
         "out_dim": emb_dim,
         "layers": LAYERS,
