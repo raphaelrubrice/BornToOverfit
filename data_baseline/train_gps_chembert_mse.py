@@ -8,6 +8,7 @@ C'est le meilleur Text Encoder selon le benchmark d'Oualid.
 import os
 import argparse
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -121,8 +122,10 @@ class MolGNN(nn.Module):
 def train_epoch(model, loader, optimizer, device):
     model.train()
     total_loss, total = 0.0, 0
+
+    pbar = tqdm(loader, desc="Training", leave=False)
     
-    for graphs, text_emb in loader:
+    for graphs, text_emb in pbar:
         graphs = graphs.to(device)
         text_emb = text_emb.to(device)
         
@@ -136,6 +139,7 @@ def train_epoch(model, loader, optimizer, device):
         
         total_loss += loss.item() * graphs.num_graphs
         total += graphs.num_graphs
+        pbar.set_postfix({'loss': loss.item()})
     
     return total_loss / total
 
@@ -228,12 +232,19 @@ def main():
     best_mrr = 0.0
     patience_counter = 0
     patience = DEFAULT_CONFIG['patience']
+
+    # Fréquence d'affichage (toutes les 5 époques)
+    LOG_FREQ = 5
     
     for epoch in range(args.epochs):
         loss = train_epoch(model, train_dl, optimizer, device)
         val_scores = eval_retrieval(model, val_graphs, val_emb, device) if val_emb else {}
         print(f"Epoch {epoch+1}/{args.epochs} | loss={loss:.6f} | {val_scores}")
         scheduler.step()
+
+        should_log = (epoch == 0) or ((epoch + 1) % LOG_FREQ == 0)
+        if should_log:
+            print(f"Epoch {epoch+1}/{args.epochs} | loss={loss:.6f} | {val_scores}")
         
         current_mrr = val_scores.get('MRR', 0)
         if current_mrr > best_mrr:
