@@ -1,0 +1,251 @@
+"""
+train_gcn_v3_gps_chembert.py - Version GPS adaptée pour ChemicalBERT (.pt)
+"""
+
+import os
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from torch_geometric.data import Batch
+from torch_geometric.nn import GPSConv, GINEConv, global_add_pool
+
+from data_utils import (
+    load_id2emb,
+    PreprocessedGraphDataset, collate_fn,
+    x_map, e_map
+)
+
+# =========================================================
+# HELPER: CHARGEMENT INTELLIGENT (.pt ou .csv)
+# =========================================================
+def smart_load_embeddings(path):
+    """Charge les embeddings depuis un CSV (lent) ou un PT (rapide)."""
+    path = str(path)
+    if path.endswith('.pt'):
+        print(f"⚡ Chargement rapide depuis {path}...")
+        data = torch.load(path)
+        ids = data['ids']
+        embs = data['embeddings']
+        return {i: embs[idx] for idx, i in enumerate(ids)}
+    else:
+        return load_id2emb(path)
+
+# =========================================================
+# CONFIG
+# =========================================================
+file_path = Path(os.path.abspath(__file__))
+parent_folder = file_path.parent
+base_path = parent_folder / "data"
+
+TRAIN_GRAPHS = str(base_path / "train_graphs.pkl")
+VAL_GRAPHS   = str(base_path / "validation_graphs.pkl")
+TEST_GRAPHS  = str(base_path / "test_graphs.pkl")
+
+# --- CHANGEMENT ICI : On pointe vers les fichiers .pt ChemicalBERT ---
+# (Assurez-vous que ces fichiers existent, sinon changez le nom)
+TRAIN_EMB_PATH = str(base_path / "train_embeddings_RealChemBERT.pt")
+VAL_EMB_PATH   = str(base_path / "validation_embeddings_RealChemBERT.pt")
+
+BATCH_SIZE = 32
+EPOCHS = 50
+LR = 5e-4
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+HIDDEN_DIM = 256
+NUM_LAYERS = 4
+NUM_HEADS = 4
+DROPOUT = 0.1
+
+
+# =========================================================
+# Feature dimensions
+# =========================================================
+ATOM_FEATURE_DIMS = [
+    len(x_map['atomic_num']), len(x_map['chirality']), len(x_map['degree']),
+    len(x_map['formal_charge']), len(x_map['num_hs']), len(x_map['num_radical_electrons']),
+    len(x_map['hybridization']), len(x_map['is_aromatic']), len(x_map['is_in_ring']),
+]
+BOND_FEATURE_DIMS = [
+    len(e_map['bond_type']), len(e_map['stereo']), len(e_map['is_conjugated']),
+]
+
+
+# =========================================================
+# Encoders
+# =========================================================
+class AtomEncoder(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(dim, hidden_dim) for dim in ATOM_FEATURE_DIMS
+        ])
+    def forward(self, x):
+        return sum(emb(x[:, i]) for i, emb in enumerate(self.embeddings))
+
+
+class BondEncoder(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(dim, hidden_dim) for dim in BOND_FEATURE_DIMS
+        ])
+    def forward(self, edge_attr):
+        return sum(emb(edge_attr[:, i]) for i, emb in enumerate(self.embeddings))
+
+
+# =========================================================
+# MODEL: GPS Transformer
+# =========================================================
+class MolGNN(nn.Module):
+    def __init__(self, hidden_dim=HIDDEN_DIM, out_dim=768, 
+                 num_layers=NUM_LAYERS, num_heads=NUM_HEADS, dropout=DROPOUT):
+        super().__init__()
+        
+        self.atom_encoder = AtomEncoder(hidden_dim)
+        self.bond_encoder = BondEncoder(hidden_dim)
+        
+        self.convs = nn.ModuleList()
+        
+        for _ in range(num_layers):
+            local_nn = nn.Sequential(
+                nn.Linear(hidden_dim, 2 * hidden_dim),
+                nn.BatchNorm1d(2 * hidden_dim),
+                nn.ReLU(),
+                nn.Linear(2 * hidden_dim, hidden_dim),
+            )
+            local_conv = GINEConv(local_nn, train_eps=True, edge_dim=hidden_dim)
+            
+            gps_conv = GPSConv(
+                channels=hidden_dim,
+                conv=local_conv,
+                heads=num_heads,
+                dropout=dropout,
+                attn_type='multihead',
+            )
+            self.convs.append(gps_conv)
+        
+        self.pool = global_add_pool
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, batch: Batch):
+        h = self.atom_encoder(batch.x)
+        edge_attr = self.bond_encoder(batch.edge_attr)
+        
+        for conv in self.convs:
+            h = conv(h, batch.edge_index, batch.batch, edge_attr=edge_attr)
+        
+        g = self.pool(h, batch.batch)
+        g = self.proj(g)
+        return F.normalize(g, dim=-1)
+
+
+# =========================================================
+# Training and Evaluation
+# =========================================================
+def train_epoch(mol_enc, loader, optimizer, device):
+    mol_enc.train()
+    total_loss, total = 0.0, 0
+    for graphs, text_emb in loader:
+        graphs, text_emb = graphs.to(device), text_emb.to(device)
+        mol_vec = mol_enc(graphs)
+        
+        # Normalisation critique (déjà présente ici, c'est bien !)
+        txt_vec = F.normalize(text_emb, dim=-1)
+        
+        loss = F.mse_loss(mol_vec, txt_vec)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(mol_enc.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item() * graphs.num_graphs
+        total += graphs.num_graphs
+    return total_loss / total
+
+
+@torch.no_grad()
+def eval_retrieval(data_path, emb_dict, mol_enc, device):
+    mol_enc.eval()
+    ds = PreprocessedGraphDataset(data_path, emb_dict)
+    dl = DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate_fn)
+    all_mol, all_txt = [], []
+    for graphs, text_emb in dl:
+        graphs, text_emb = graphs.to(device), text_emb.to(device)
+        all_mol.append(mol_enc(graphs))
+        all_txt.append(F.normalize(text_emb, dim=-1))
+    all_mol, all_txt = torch.cat(all_mol), torch.cat(all_txt)
+    sims = all_txt @ all_mol.t()
+    ranks = sims.argsort(dim=-1, descending=True)
+    N = all_txt.size(0)
+    correct = torch.arange(N, device=sims.device)
+    pos = (ranks == correct.unsqueeze(1)).nonzero()[:, 1] + 1
+    mrr = (1.0 / pos.float()).mean().item()
+    results = {"MRR": mrr}
+    for k in (1, 5, 10):
+        results[f"R@{k}"] = (pos <= k).float().mean().item()
+    return results
+
+
+def main():
+    print("=" * 60)
+    print("TRAINING MolGNN v3 - GPS Transformer (ChemicalBERT Adapted)")
+    print("=" * 60)
+    print(f"Device: {DEVICE}, Hidden: {HIDDEN_DIM}, Heads: {NUM_HEADS}, Layers: {NUM_LAYERS}")
+
+    # --- CHANGEMENT ICI : Chargement intelligent ---
+    train_emb = smart_load_embeddings(TRAIN_EMB_PATH)
+    val_emb = smart_load_embeddings(VAL_EMB_PATH) if os.path.exists(VAL_EMB_PATH) else None
+    
+    emb_dim = len(next(iter(train_emb.values())))
+    print(f"Embedding dimension: {emb_dim}")
+
+    if not os.path.exists(TRAIN_GRAPHS):
+        print(f"Error: {TRAIN_GRAPHS} not found"); return
+    
+    train_ds = PreprocessedGraphDataset(TRAIN_GRAPHS, train_emb)
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+
+    mol_enc = MolGNN(hidden_dim=HIDDEN_DIM, out_dim=emb_dim, num_layers=NUM_LAYERS).to(DEVICE)
+    print(f"Parameters: {sum(p.numel() for p in mol_enc.parameters() if p.requires_grad):,}")
+
+    optimizer = torch.optim.AdamW(mol_enc.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+    best_mrr = 0.0
+    patience = 5
+    patience_counter = 0
+
+    for ep in range(EPOCHS):
+        loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE)
+        val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE) if val_emb else {}
+        print(f"Epoch {ep+1}/{EPOCHS} | loss={loss:.4f} | {val_scores}")
+        scheduler.step()
+
+        current_mrr = val_scores.get('MRR', 0)
+        if current_mrr > best_mrr:
+            best_mrr = current_mrr
+            patience_counter = 0
+            # Sauvegarde adaptée
+            torch.save(mol_enc.state_dict(), str(base_path / "model_checkpoint_v3_gps_chembert.pt"))
+            print(f"  → New best MRR: {best_mrr:.4f}")
+        else:
+            patience_counter += 1
+            print(f"  → No improvement ({patience_counter}/{patience})")
+
+        if patience_counter >= patience:
+            print(f"\nEarly stopping at epoch {ep+1}")
+            break
+
+    print(f"\nDone. Best MRR: {best_mrr:.4f}")
+
+
+if __name__ == "__main__":
+    main()
