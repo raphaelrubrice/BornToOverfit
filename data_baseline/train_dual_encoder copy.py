@@ -116,20 +116,14 @@ class DualEncoder(nn.Module):
         t_emb = self.text_proj(t_out.last_hidden_state[:, 0, :])
         return F.normalize(g_emb, dim=-1), F.normalize(t_emb, dim=-1)
 
-# --- LOSS CORRIGÉE POUR FP16 ---
+# --- LOSS ---
 def triplet_loss(mol_vec, txt_vec, margin=0.2):
     sims = mol_vec @ txt_vec.t()
     mask = torch.eye(sims.size(0), device=sims.device).bool()
-    
-    # CORRECTION : On utilise la plus petite valeur supportée par le type de données actuel
-    # En Float16 (AMP), min_value sera ~ -65000, ce qui ne plante pas.
-    min_value = torch.finfo(sims.dtype).min
-    neg_sims = sims.masked_fill(mask, min_value)
-    
+    neg_sims = sims.masked_fill(mask, -1e9)  # ← Changé de -inf à -1e9
     hard_neg_m2t = neg_sims.max(dim=1, keepdim=True)[0]
     hard_neg_t2m = neg_sims.max(dim=0, keepdim=True)[0].t()
     pos_sims = sims.diag().unsqueeze(1)
-    
     loss = (F.relu(margin + hard_neg_m2t - pos_sims).mean() + 
             F.relu(margin + hard_neg_t2m - pos_sims).mean())
     return loss / 2
@@ -145,13 +139,9 @@ def evaluate_retrieval(model, val_loader, device):
         graphs = graphs.to(device)
         text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
         
-        # En eval, on peut désactiver autocast ou le laisser, mais ici on le garde
-        # pour être cohérent, même si moins critique.
-        with autocast():
-             g_emb, t_emb = model(graphs, text_inputs)
-        
-        all_g_emb.append(g_emb.float()) # On repasse en float32 pour le calcul de similarité précis
-        all_t_emb.append(t_emb.float())
+        g_emb, t_emb = model(graphs, text_inputs)
+        all_g_emb.append(g_emb)
+        all_t_emb.append(t_emb)
     
     all_g_emb = torch.cat(all_g_emb, dim=0)
     all_t_emb = torch.cat(all_t_emb, dim=0)
@@ -194,7 +184,7 @@ def main():
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     print("=" * 70)
-    print("🚀 DUAL ENCODER TRAINING - OPTIMIZED (AMP FIX)")
+    print("🚀 DUAL ENCODER TRAINING - OPTIMIZED")
     print("=" * 70)
     print(f"LR GNN      : {args.lr_gnn}")
     print(f"LR BERT     : {args.lr_bert}")
@@ -242,7 +232,7 @@ def main():
          'weight_decay': args.weight_decay},
         {'params': model.text_encoder.parameters(), 
          'lr': args.lr_bert, 
-         'weight_decay': args.weight_decay / 10}, 
+         'weight_decay': args.weight_decay / 10},  # ← Plus faible pour BERT
         {'params': model.text_proj.parameters(), 
          'lr': args.lr_bert, 
          'weight_decay': args.weight_decay}
@@ -257,7 +247,7 @@ def main():
     )
 
     scaler = GradScaler()
-    best_mrr = 0.0
+    best_mrr = 0.0  # ← Changé de best_loss à best_mrr
     patience_counter = 0
 
     for epoch in range(args.epochs):
@@ -294,13 +284,15 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs} | "
               f"Train Loss: {avg_loss:.4f} | "
               f"Val MRR: {val_metrics['MRR']:.4f} | "
-              f"R@1: {val_metrics['R@1']:.4f}")
+              f"R@1: {val_metrics['R@1']:.4f} | "
+              f"R@5: {val_metrics['R@5']:.4f}")
         
-        # === EARLY STOPPING ===
+        # === EARLY STOPPING (basé sur VAL MRR) ===
         if val_metrics['MRR'] > best_mrr:
             best_mrr = val_metrics['MRR']
             patience_counter = 0
             
+            # Nom de fichier complet
             effective_bs = args.batch_size * args.grad_accum
             save_name = (f"dual_lrGNN{args.lr_gnn}_lrBERT{args.lr_bert}_"
                         f"wd{args.weight_decay}_frz{args.freeze_layers}_"
@@ -308,16 +300,25 @@ def main():
             
             torch.save({
                 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch,
+                'best_mrr': best_mrr,
                 'args': vars(args),
-                'best_mrr': best_mrr
+                'val_metrics': val_metrics
             }, Path(args.data_dir) / save_name)
             
             print(f"  💾 New Best MRR: {best_mrr:.4f} | Saved: {save_name}")
         else:
             patience_counter += 1
+            print(f"  → No improvement ({patience_counter}/{args.patience})")
+            
             if patience_counter >= args.patience:
                 print("🛑 Early stopping")
                 break
+    
+    print("\n" + "=" * 70)
+    print(f"✅ Training done. Best Val MRR: {best_mrr:.4f}")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
