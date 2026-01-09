@@ -264,7 +264,7 @@ def load_molgnn_from_checkpoint(
 # =========================================================
 # Main Training Loop
 # =========================================================
-def main(parent_folder, folder, model, loss_func):
+def main(parent_folder, folder, model, loss_func, epochs):
     print(f"Device: {DEVICE}")
     model = model.lower()
 
@@ -295,16 +295,16 @@ def main(parent_folder, folder, model, loss_func):
     # Init Early Stopping
     early_stopper = EarlyStopping(patience=PATIENCE, mode='max')
 
-    print(f"Start Training: {EPOCHS} epochs, Batch: {BATCH_SIZE}, Hidden: {HIDDEN}")
+    print(f"Start Training: {epochs} epochs, Batch: {BATCH_SIZE}, Hidden: {HIDDEN}")
 
     # Training Loop
-    for ep in range(EPOCHS):
+    for ep in range(epochs):
         train_loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE, loss_func=loss_func)
         val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE, dl=val_dl)
         
         current_mrr = val_scores['MRR']
         str_val = " | ".join([f"{k}: {v:.4f}" for k, v in val_scores.items()])
-        print(f"Epoch {ep+1}/{EPOCHS} | loss={train_loss:.4f} | {str_val}")
+        print(f"Epoch {ep+1}/{epochs} | loss={train_loss:.4f} | {str_val}")
 
         # Check Early Stopping
         stop_signal, is_best = early_stopper.check_stop(mol_enc, current_mrr, ep)
@@ -349,6 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("-model", default="gine", type=str)
     parser.add_argument("-loss", default="mse", type=str)
+    parser.add_argument("-epochs", default=50, type=int)
 
     args = parser.parse_args()
     data_folder = args.f_data
@@ -373,7 +374,6 @@ if __name__ == "__main__":
 
     # Training parameters
     BATCH_SIZE = 64
-    EPOCHS = 50
     PATIENCE = 5
     LR = 1e-3
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -381,4 +381,4 @@ if __name__ == "__main__":
     HIDDEN = 256
     LAYERS = 3
 
-    main(parent_folder, folder, args.model, args.loss)
+    main(parent_folder, folder, args.model, args.loss, args.epochs)

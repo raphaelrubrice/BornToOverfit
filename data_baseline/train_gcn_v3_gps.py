@@ -240,7 +240,7 @@ def load_molgnn_gps_from_checkpoint(
 
     return gnn
 
-def main(data_folder, output_folder, loss_func):
+def main(data_folder, output_folder, loss_func, epochs):
     loss_func = loss_func.lower()
 
     # Setup Paths
@@ -291,18 +291,18 @@ def main(data_folder, output_folder, loss_func):
     print(f"Parameters: {sum(p.numel() for p in mol_enc.parameters() if p.requires_grad):,}")
 
     optimizer = torch.optim.AdamW(mol_enc.parameters(), lr=LR, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     # Initialize Early Stopping (Mode='max' for MRR)
     early_stopper = EarlyStopping(patience=PATIENCE, mode='max')
 
     # Training Loop
-    for ep in range(EPOCHS):
+    for ep in range(epochs):
         loss = train_epoch(mol_enc, train_dl, optimizer, DEVICE, loss_func=loss_func)
         val_scores = eval_retrieval(VAL_GRAPHS, val_emb, mol_enc, DEVICE, dl=val_dl) if val_emb else {}
         
         str_val = " | ".join([f"{k}: {v:.4f}" for k, v in val_scores.items()])
-        print(f"Epoch {ep+1}/{EPOCHS} | loss={loss:.4f} | {str_val}")
+        print(f"Epoch {ep+1}/{epochs} | loss={loss:.4f} | {str_val}")
         
         current_mrr = val_scores.get('MRR', 0)
         
@@ -354,6 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("-loss", default="mse", type=str)
+    parser.add_argument("-epochs", default=50, type=int)
 
     args = parser.parse_args()
-    main(data_folder=args.f_data, output_folder=args.f, loss_func=args.loss)
+    main(data_folder=args.f_data, output_folder=args.f, loss_func=args.loss, epochs=args.epochs)
