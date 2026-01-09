@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-knn_generate.py
-
-kNN + LLM generation with GRPO fine-tuning (TRL).
+kNN + LLM generation with Supervised fine-tuning (and RL possible).
 Optimized for speed by caching token lengths.
 """
-
-import os
+import os, shutil
 import re
 import json
 from collections import Counter
@@ -25,7 +22,7 @@ from torch.utils.data import DataLoader
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 
-from datasets import Dataset
+from datasets import Dataset as HFDataset
 
 from transformers import (
     AutoTokenizer,
@@ -87,7 +84,7 @@ except Exception:
 
 try:
     from torch_geometric.data import Batch, Data
-    from graph_llm_aligned import GraphAugmentedLLM, load_graph_components, save_graph_components
+    from graph_llm_aligned import *
 except ImportError:
     print("Warning: graph_llm_aligned or torch_geometric not found. GrALE features disabled.")
     GraphAugmentedLLM = None
@@ -130,36 +127,150 @@ class TokenLengthCache:
         """Fallback for non-cached text"""
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
+class SmartCache:
+    """
+    Manages loading and saving datasets to disk with robust configuration checking.
+    Handles floating point rounding and numpy types to prevent false mismatches.
+    """
+    def __init__(self, cache_dir: str, config: Dict[str, Any]):
+        self.cache_dir = cache_dir
+        self.config = config
+        self.config_path = os.path.join(cache_dir, "config.json") # Renamed to avoid collision
+        
+    def _sanitize(self, obj):
+        """Recursively converts numpy types and rounds floats for stable comparison."""
+        if isinstance(obj, (float, np.floating)):
+            return round(float(obj), 5)  # Round to 6 decimals
+        if isinstance(obj, (np.integer, int)):
+            return int(obj)
+        if isinstance(obj, (np.ndarray, list, tuple)):
+            return [self._sanitize(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: self._sanitize(v) for k, v in obj.items()}
+        return obj
+
+    def is_cached(self) -> bool:
+        """Check if cache exists and config matches."""
+        if not os.path.exists(self.cache_dir):
+            return False
+        if not os.path.exists(self.config_path):
+            print(f"[SmartCache] Cache dir exists but config missing at {self.config_path}")
+            return False
+        
+        try:
+            with open(self.config_path, 'r') as f:
+                saved_config = json.load(f)
+            
+            clean_saved = self._sanitize(saved_config)
+            clean_current = self._sanitize(self.config)
+            
+            # Serialize to sort keys and ensure comparability
+            s_saved = json.dumps(clean_saved, sort_keys=True)
+            s_current = json.dumps(clean_current, sort_keys=True)
+            
+            if s_saved == s_current:
+                return True
+            else:
+                print(f"[SmartCache] Config mismatch in {self.cache_dir}.")
+                # Debug: Find first difference
+                for k in clean_current:
+                    v_curr = clean_current.get(k)
+                    v_save = clean_saved.get(k)
+                    if v_curr != v_save:
+                        print(f"   > Param '{k}' changed: {v_save} -> {v_curr}")
+                return False
+                
+        except Exception as e:
+            print(f"[SmartCache] Error checking config: {e}. Recomputing...")
+            return False
+
+    def load(self) -> HFDataset:
+        print(f"[SmartCache] Loading cached dataset from {self.cache_dir}...")
+        return HFDataset.load_from_disk(self.cache_dir)
+
+    def save(self, dataset: HFDataset):
+        print(f"[SmartCache] Saving dataset to {self.cache_dir}...")
+        if os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir)
+        dataset.save_to_disk(self.cache_dir)
+        
+        # Save the sanitized config so what we check against is exactly what we saved
+        with open(self.config_path, 'w') as f:
+            json.dump(self._sanitize(self.config), f, indent=4)
+
 # --------------------------------------------------------------------------------------
 # Helper: Dynamic Context Length Detection
 # --------------------------------------------------------------------------------------
 def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
+    """
+    Auto-detects context length for standard HF models and GraphAugmentedLLM checkpoints.
+    """
+    limit = None
+    
+    # 1. Try Standard Hugging Face Config
     try:
-        config = AutoConfig.from_pretrained(model_name_or_path)
+        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
         possible_limits = [
             getattr(config, "max_position_embeddings", None),
             getattr(config, "n_positions", None),
             getattr(config, "seq_length", None),
             getattr(config, "max_seq_len", None), 
+            getattr(config, "model_max_length", None), 
         ]
         valid_limits = [x for x in possible_limits if x is not None and isinstance(x, int)]
-        limit = max(valid_limits) if valid_limits else 1024 
-        
+        if valid_limits:
+            limit = max(valid_limits)
+    except Exception:
+        # Not a standard HF config or directory
+        pass
+
+    # 2. GrALE Fallback: Inspect checkpoint for backbone
+    if limit is None:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+            candidate_pt = None
+            if os.path.isdir(model_name_or_path):
+                # Check for standard GrALE checkpoint name
+                pt_path = os.path.join(model_name_or_path, "rich_grale.pt")
+                if os.path.exists(pt_path):
+                    candidate_pt = pt_path
+            elif model_name_or_path.endswith(".pt") and os.path.exists(model_name_or_path):
+                candidate_pt = model_name_or_path
+            
+            if candidate_pt:
+                print(f" [Context Detection] Inspecting GrALE checkpoint: {candidate_pt}")
+                # Load only the config part if possible, or map to CPU to save memory
+                ckpt = torch.load(candidate_pt, map_location='cpu')
+                
+                # Extract backbone path from GraleConfig
+                grale_config = ckpt.get('config', None)
+                
+                if grale_config and hasattr(grale_config, 'llm_model_path') and grale_config.llm_model_path:
+                    backbone = grale_config.llm_model_path
+                    print(f" [Context Detection] GrALE Backbone identified: {backbone}")
+                    # Recurse to find the limit of the backbone
+                    return get_safe_context_length(backbone, cap)
+        except Exception as e:
+            print(f" [Context Detection] GrALE inspection failed: {e}")
+
+    # 3. Fallback Default
+    if limit is None:
+        limit = 1024 
+
+    # 4. Double check with Tokenizer (useful for models like T5/Llama where config might be ambiguous)
+    try:
+        # Only attempt if it looks like a valid path or HF ID (avoiding "grale" keyword crashes)
+        if os.path.exists(model_name_or_path) or "/" in model_name_or_path:
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True, trust_remote_code=True)
             if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 1e9:
                 limit = max(limit, tokenizer.model_max_length)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-        print(f" [Context Detection] Model native limit: {limit}")
-        if limit > cap:
-            print(f" [Context Detection] Capping context to {cap} for memory safety.")
-            return cap
-        return limit
-    except Exception as e:
-        print(f" [Context Detection] Warning: Could not auto-detect. Error: {e}")
-        return 1024
+    print(f" [Context Detection] Model native limit: {limit}")
+    if limit > cap:
+        print(f" [Context Detection] Capping context to {cap} for memory safety.")
+        return cap
+    return limit
 
 def prompt_as_chat(prompt_text: str) -> List[Dict[str, str]]:
     return [{"role": "user", "content": prompt_text}]
@@ -650,7 +761,7 @@ def build_knn_prompt_dataset(
     max_samples: Optional[int] = None,
     leave_one_out: bool = True,
     desc_key="Train",
-) -> Dataset:
+) -> HFDataset:
     
     # --- 1. Setup & Loading ---
     if isinstance(tokenizer_or_path, str):
@@ -801,7 +912,8 @@ def build_knn_prompt_dataset(
         references.append(train_id2desc.get(qid, ""))
         ids_list.append(str(qid))
 
-    return Dataset.from_dict({"ids":ids_list, "prompt": prompts, "reference": references})
+    print([len(val) for val in [ids_list, prompts, references]])
+    return HFDataset.from_dict({"ids":ids_list, "prompt": prompts, "reference": references})
 
 # --------------------------------------------------------------------------------------
 # SFT
@@ -905,9 +1017,9 @@ class CausalSeq2SeqTrainer(Seq2SeqTrainer):
 def sft_finetune_on_knn(
     base_model_name_or_path: str,
     output_dir: str,
-    train_dataset: Dataset,
+    train_dataset: HFDataset,
     device: str,
-    eval_dataset: Optional[Dataset] = None,
+    eval_dataset: Optional[HFDataset] = None,
     graph_map: Optional[Dict[str, Any]] = None,
     grale_paths: Optional[Dict[str, str]] = None,
     use_lora: bool = True,
@@ -928,30 +1040,37 @@ def sft_finetune_on_knn(
     neftune_noise_alpha: float = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
-    is_grale = (base_model_name_or_path.lower() == "grale")
+    is_grale = True if graph_map is not None else False
+
+    # We need a max_length that is an INT (for the Trainer) 
+    # but large enough to fit the Prompt + Generation (to avoid crashes).
+    safe_max_total_len = max_prompt_length + max_completion_length
+    print(f"Setting generation max_length to: {safe_max_total_len} (Prompt: {max_prompt_length} + Gen: {max_completion_length})")
+
+    # Set default patience for Early Stopping
+    if patience is None:
+        patience = min(5, int(0.05 * num_train_steps))
 
     if is_grale:
         print("Loading GraphAugmentedLLM (RichGrALE + Projector + LLM)...")
         if not grale_paths:
             raise ValueError("GrALE paths (rich_grale.pt, projector.pt) must be provided via -f_grale or -f")
         
-        # Load underlying LLM config for tokenizer
-        # Assuming we hardcoded DeepSeek in the aligned script, or pass it via args?
-        # For now, we assume the user provides the *Text* LLM path if they want specific config,
-        # but here 'base_model' is 'grale'. We need the actual LLM name.
-        # We will assume DeepSeek 1.5B as per context or extract from saved config if possible.
-        # Fallback to a default or require an extra arg. Let's use the one from the saved projector logic if implicit,
-        # but simpler: assume standard tokenizer.
-        real_llm_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" # Default from context
-        
         # Load components
         grale_model, projector_model = load_graph_components(os.path.dirname(grale_paths['grale']))
+
+        # Load underlying LLM config for tokenizer
+        real_llm_path = grale_model.config.llm_model_path
+        
+        
         
         model = GraphAugmentedLLM(
-            llm_name_or_path=real_llm_path,
+            llm_model_path=real_llm_path,
             graph_encoder=grale_model,
             projector=projector_model,
-            use_lora=use_lora # Wrapper applies LoRA to LLM
+            use_lora=use_lora,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha if lora_alpha is not None else 2 * lora_r,
         )
         
         # UNFREEZE EVERYTHING for Full Augmented Training
@@ -962,7 +1081,8 @@ def sft_finetune_on_knn(
         
         config = model.llm.config
         tokenizer = AutoTokenizer.from_pretrained(real_llm_path, use_fast=True, trust_remote_code=True)
-        
+        print(f"\n[CHECK] Model: {model}")
+        print(f"\n[CHECK] Model class: {type(model)}")
     else:
         config = AutoConfig.from_pretrained(base_model_name_or_path)
 
@@ -981,30 +1101,29 @@ def sft_finetune_on_knn(
         if lora_alpha is None:
             lora_alpha = 2 * lora_r
 
-    # We need a max_length that is an INT (for the Trainer) 
-    # but large enough to fit the Prompt + Generation (to avoid crashes).
-    safe_max_total_len = max_prompt_length + max_completion_length
-    print(f"Setting generation max_length to: {safe_max_total_len} (Prompt: {max_prompt_length} + Gen: {max_completion_length})")
+        # Initialize Model
+        if config.is_encoder_decoder:
+            model_cls = AutoModelForSeq2SeqLM
+        else:
+            model_cls = AutoModelForCausalLM
 
-    # Set default patience for Early Stopping
-    if patience is None:
-        patience = min(5, int(0.05 * num_train_steps))
+        
+        model = model_cls.from_pretrained(
+            base_model_name_or_path,
+            dtype=dtype,
+            device_map="auto"
+        )
 
-    # Initialize Model
-    if config.is_encoder_decoder:
-        model_cls = AutoModelForSeq2SeqLM
-    else:
-        model_cls = AutoModelForCausalLM
+    print(f"\n[CHECK] Model: {model}")
+    print(f"\n[CHECK] Model class: {type(model)}")
 
-    model = model_cls.from_pretrained(
-        base_model_name_or_path,
-        dtype=dtype,
-        device_map="auto"
-    )
     model.gradient_checkpointing_enable()
 
     if model.generation_config is None:
-        model.generation_config = GenerationConfig.from_pretrained(base_model_name_or_path)
+        if is_grale:
+            model.generation_config = GenerationConfig.from_pretrained(model.graph_encoder.config.llm_model_path)
+        else:
+            model.generation_config = GenerationConfig.from_pretrained(base_model_name_or_path)
     
     # 1. Limit the NEW tokens generated
     model.generation_config.max_new_tokens = max_completion_length
@@ -1014,7 +1133,7 @@ def sft_finetune_on_knn(
 
     # Initialize Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        base_model_name_or_path,
+        base_model_name_or_path if not is_grale else model.graph_encoder.config.llm_model_path,
         use_fast=True,
         trust_remote_code=True
     )
@@ -1029,21 +1148,26 @@ def sft_finetune_on_knn(
 
     # Configure LoRA
     if use_lora:
-        if config.is_encoder_decoder:
-            task_type = "SEQ_2_SEQ_LM"
-        else:
-            task_type = "CAUSAL_LM"
+        if not is_grale:
+            if config.is_encoder_decoder:
+                task_type = "SEQ_2_SEQ_LM"
+            else:
+                task_type = "CAUSAL_LM"
 
-        lora_cfg = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type=task_type,
-            target_modules="all-linear"
-        )
-        model = get_peft_model(model, lora_cfg)
+            lora_cfg = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type=task_type,
+                target_modules="all-linear"
+            )
+    
+            model = get_peft_model(model, lora_cfg)
         
+        print(f"\n[CHECK] Model: {model}")
+        print(f"\n[CHECK] Model class: {type(model)}")
+
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
             
@@ -1096,22 +1220,59 @@ def sft_finetune_on_knn(
             labels[i] = -100
             
         full["labels"] = labels
-        if "ids" in ex:
-            full["ids"] = ex["ids"]
+
+        if is_grale and "ids" in ex:
+            full["id"] = ex["ids"]
+            
         return full
 
-    tokenized_train = train_dataset.map(
-        lambda x: _tokenize(x, is_eval=False),
-        remove_columns=train_dataset.column_names
-    )
+    # 1. Define Cache Config for Tokenization
+    # We include model path, max lengths, and dataset size to invalidate if inputs change
+    tok_cache_config = {
+        "base_model": base_model_name_or_path,
+        "max_prompt_length": max_prompt_length,
+        "max_completion_length": max_completion_length,
+        "dataset_fingerprint": str(train_dataset._fingerprint), # HF Dataset unique ID
+        "is_grale": is_grale,
+        "use_lora": use_lora
+    }
+    
+    # 2. Setup Cache Path (subdirectory of output_dir)
+    train_cache_dir = os.path.join(output_dir, "cache_tokenized_train")
+    
+    # 3. Load or Compute
+    train_cacher = SmartCache(train_cache_dir, tok_cache_config)
+    
+    if train_cacher.is_cached():
+        tokenized_train = train_cacher.load()
+    else:
+        print("Tokenizing training set...")
+        tokenized_train = train_dataset.map(
+            lambda x: _tokenize(x, is_eval=False),
+            remove_columns=train_dataset.column_names,
+            desc="Tokenizing Train"
+        )
+        train_cacher.save(tokenized_train)
 
+    # 4. Same for Eval (if exists)
     tokenized_eval = None
     if eval_dataset is not None:
-        print("Tokenizing validation set for Generation Metrics...")
-        tokenized_eval = eval_dataset.map(
-            lambda x: _tokenize(x, is_eval=True),
-            remove_columns=eval_dataset.column_names
-        )
+        eval_cache_config = tok_cache_config.copy()
+        eval_cache_config["dataset_fingerprint"] = str(eval_dataset._fingerprint)
+        eval_cache_dir = os.path.join(output_dir, "cache_tokenized_eval")
+        
+        eval_cacher = SmartCache(eval_cache_dir, eval_cache_config)
+        
+        if eval_cacher.is_cached():
+            tokenized_eval = eval_cacher.load()
+        else:
+            print("Tokenizing validation set...")
+            tokenized_eval = eval_dataset.map(
+                lambda x: _tokenize(x, is_eval=True),
+                remove_columns=eval_dataset.column_names,
+                desc="Tokenizing Eval"
+            )
+            eval_cacher.save(tokenized_eval)
 
     # --- Compute Metrics Function ---
     def compute_metrics(eval_preds):
@@ -1244,15 +1405,21 @@ def sft_finetune_on_knn(
         compute_metrics=compute_metrics if tokenized_eval else None
     )
 
+    print(f"\n[CHECK] Model: {model}")
+    print(f"\n[CHECK] Model class: {type(model)}")
+
     trainer.train()
 
     # Save logic for GrALE
+    print("\nIS_GRALE", is_grale)
     if is_grale:
         # Save components
+        print("\nSAVING GRALE")
         save_graph_components(model.graph_encoder, model.projector, output_dir, model.graph_encoder.config.llm_model_path)
         model.llm.save_pretrained(output_dir)
     else:
-        if use_lora: model = model.merge_and_unload()
+        if use_lora: 
+            model = model.merge_and_unload()
         model.save_pretrained(output_dir)
 
     tokenizer.save_pretrained(output_dir)
@@ -1264,7 +1431,7 @@ def sft_finetune_on_knn(
 def rl_finetune_on_knn(
     base_model_name_or_path: str,
     output_dir: str,
-    train_dataset: Dataset,
+    train_dataset: HFDataset,
     device: str,
     rl_algo: str = "ppo",
     use_lora: bool = True,
@@ -1286,7 +1453,9 @@ def rl_finetune_on_knn(
     os.makedirs(output_dir, exist_ok=True)
     rl_algo = (rl_algo or "grpo").strip().lower()
     tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True)
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+
+    if tokenizer.pad_token is None: 
+        tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     config = AutoConfig.from_pretrained(base_model_name_or_path)
 
@@ -1356,18 +1525,27 @@ def rl_finetune_on_knn(
     trainer = PPOTrainer(config=ppo_cfg, model=model, ref_model=ref_model, tokenizer=tokenizer, dataset=train_dataset, data_collator=_collate)
     gen_kwargs = dict(max_new_tokens=max_completion_length, do_sample=True, top_p=0.9, temperature=0.8, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
 
+    print(f"\n[CHECK] Model: {model}")
+    print(f"\n[CHECK] Model class: {type(model)}")
+
     step = 0
     for batch in trainer.dataloader:
-        if step >= num_train_steps: break
+        if step >= num_train_steps: 
+            break
         query_tensors = batch["input_ids"].to(trainer.accelerator.device)
         attention_mask = batch.get("attention_mask", None)
-        if attention_mask is not None: attention_mask = attention_mask.to(trainer.accelerator.device)
+        if attention_mask is not None: 
+            attention_mask = attention_mask.to(trainer.accelerator.device)
+
         response_tensors = trainer.generate(query_tensors, attention_mask=attention_mask, **gen_kwargs)
         responses_dec = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+
         completions = [[{"role": "assistant", "content": r}] for r in responses_dec]
+
         reward_vals = reward_fn(completions=completions, reference=batch["reference_text"])
         rewards = [torch.tensor(r, device=trainer.accelerator.device) for r in reward_vals]
         trainer.step(query_tensors, response_tensors, rewards)
+
         step += 1
 
     trainer.save_pretrained(output_dir)
@@ -1402,7 +1580,7 @@ def generate_desc(
     do_sample: bool = True,
     evaluate: bool = False,
     ) -> pd.DataFrame:
-    
+
     if is_grale:
         print("Detected GrALE Inference Mode.")
         
@@ -1421,7 +1599,7 @@ def generate_desc(
 
         # 3. Initialize Augmented Model using the Configured Backbone
         llm = GraphAugmentedLLM(
-            llm_name_or_path=llm_backbone,
+            llm_model_path=llm_backbone,
             graph_encoder=grale_model,
             projector=projector_model,
             use_lora=False 
@@ -1460,14 +1638,17 @@ def generate_desc(
         dtype = torch.float32
 
     model_cls = AutoModelForSeq2SeqLM if is_seq2seq else AutoModelForCausalLM
-    llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto")
-    llm.eval()
     
-    if hasattr(torch, "compile") and os.name != "nt":
-        try:
-            llm = torch.compile(llm)
-        except Exception:
-            pass
+    # --- FIX: Ensure we do NOT overwrite GrALE model ---
+    if not is_grale:
+        llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto")
+        llm.eval()
+    
+        if hasattr(torch, "compile") and os.name != "nt":
+            try:
+                llm = torch.compile(llm)
+            except Exception:
+                pass
 
     print("Loading Data & Caches...")
     train_id2desc = load_descriptions_from_graphs(train_graphs)
@@ -1595,6 +1776,11 @@ def generate_desc(
 
     print(f"Generating with Batch Size {gen_batch_size}...")
     
+    if is_grale:
+        decoder_start_tid = llm.llm.config.decoder_start_token_id if hasattr(llm.llm.config, "decoder_start_token_id") else tokenizer.pad_token_id
+    else:
+        decoder_start_tid = llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id
+    
     gen_cfg = GenerationConfig(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,       
@@ -1603,14 +1789,18 @@ def generate_desc(
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        decoder_start_token_id=llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id
+        decoder_start_token_id=decoder_start_tid
     )
 
     generations = []
     use_chat_template = bool(hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None))
 
+    print(f"\n[CHECK] Model: {llm}")
+    print(f"\n[CHECK] Model class: {type(llm)}")
+
     for start in tqdm(range(0, len(sorted_prompts), gen_batch_size), desc="Generating"):
         batch_prompts = sorted_prompts[start : start + gen_batch_size]
+        batch_ids = sorted_ids[start : start + gen_batch_size] # Get IDs for graph lookup
         tokenizer.truncation_side = 'left' 
 
         if use_chat_template:
@@ -1636,14 +1826,33 @@ def generate_desc(
             input_ids = inputs["input_ids"].to(llm.device)
 
         attention_mask = (input_ids != tokenizer.pad_token_id).long()
+        
+        # --- FIX: Prepare Graph Batch for GrALE ---
+        gen_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "generation_config": gen_cfg,
+            "use_cache": True
+        }
+
+        if is_grale and graph_map is not None:
+            # 1. Retrieve Graphs for this batch
+            graphs = [graph_map[str(bid)] for bid in batch_ids if str(bid) in graph_map]
+            
+            # 2. Batch them using PyG
+            if graphs:
+                batch_graph = Batch.from_data_list(graphs)
+                batch_graph = batch_graph.to(llm.device) # Move to same device as LLM
+                gen_kwargs["graph_data"] = batch_graph
+            else:
+                # If no graphs found (edge case), GrALE might handle None or crash.
+                # Ideally, we pass None and GrALE relies on text only, 
+                # but GraphAugmentedLLM likely expects a tensor.
+                pass 
+        # ------------------------------------------
 
         with torch.no_grad():
-            outputs = llm.generate(
-                input_ids=input_ids, 
-                attention_mask=attention_mask, 
-                generation_config=gen_cfg, 
-                use_cache=True
-            )
+            outputs = llm.generate(**gen_kwargs)
 
         if is_seq2seq:
             texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -1688,7 +1897,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
-    parser.add_argument("--f_grale", default=None, type=str, help="Folder containing GrALE checkpoints (rich_grale.pt). Defaults to -f if not set.")
+    parser.add_argument("-f_grale", default=None, type=str, help="Folder containing GrALE checkpoints (rich_grale.pt). Defaults to -f if not set.")
 
     parser.add_argument("--k", default=3, type=int)
     parser.add_argument("--encode_batch_size", default=128, type=int)
@@ -1746,18 +1955,18 @@ def main():
         }
         print(f"GrALE Mode Active. Checkpoints: {grale_paths}")
         
-        # # Load ALL graphs into memory for the Collator
-        # print("Loading all graph data for training lookup...")
-        # import pickle
-        # graph_map = {}
-        # for pkl in [TRAIN_GRAPHS, VAL_GRAPHS, TEST_GRAPHS]:
-        #     if os.path.exists(pkl):
-        #         with open(pkl, 'rb') as f:
-        #             glist = pickle.load(f)
-        #             for g in glist:
-        #                 if hasattr(g, 'id'):
-        #                     graph_map[str(g.id)] = g
-        # print(f"Loaded {len(graph_map)} graphs into memory.")
+        # Load ALL graphs into memory for the Collator
+        print("Loading all graph data for training lookup...")
+        import pickle
+        graph_map = {}
+        for pkl in [TRAIN_GRAPHS, VAL_GRAPHS, TEST_GRAPHS]:
+            if os.path.exists(pkl):
+                with open(pkl, 'rb') as f:
+                    glist = pickle.load(f)
+                    for g in glist:
+                        if hasattr(g, 'id'):
+                            graph_map[str(g.id)] = g
+        print(f"Loaded {len(graph_map)} graphs into memory.")
         is_grale = True
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1783,36 +1992,34 @@ def main():
     # We need thresholds to be consistent between Train and Test.
     global_thresholds = None
 
-    # If we are training, we MUST compute them from training data
     if args.do_finetune:
-        print("Computing global similarity thresholds from Training Data...")
-        
-        # We need the training GNN embeddings to compute thresholds
-        # (Re-using the logic from build_dataset briefly to get sims)
-        train_id2emb = load_id2emb(TRAIN_EMB_CSV)
-        train_ids = list(train_id2emb.keys())
-        train_tgt_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
-        train_tgt_embs = F.normalize(train_tgt_embs, dim=-1)
-        
-        # Encode Train Graphs
-        print("Encoding training graphs for threshold calibration...")
-        train_gnn_embs, _ = encode_graphs(gnn, TRAIN_GRAPHS, device=device, batch_size=args.encode_batch_size)
-        
-        # Leave-one-out KNN
-        # (We only need the sims, not the indices, to determine distribution)
-        # Note: This is fast on GPU
-        sims = train_gnn_embs @ train_tgt_embs.t()
-        # Mask self
-        n = len(train_ids)
-        mask = torch.eye(n, device=device).bool()
-        sims.masked_fill_(mask, -float('inf'))
-        
-        # Get top k
-        top_sims, _ = torch.topk(sims, k=args.k, dim=-1)
-        
-        # Compute & Save
-        global_thresholds = compute_similarity_thresholds(top_sims)
-        save_thresholds(global_thresholds, THRESHOLDS_PATH)
+        # OPTIMIZATION: Check if thresholds already exist to avoid expensive re-computation
+        if os.path.exists(THRESHOLDS_PATH):
+            print(f"Loading existing thresholds from {THRESHOLDS_PATH}...")
+            global_thresholds = load_thresholds(THRESHOLDS_PATH)
+        else:
+            print("Computing global similarity thresholds from Training Data...")
+            
+            # We need the training GNN embeddings to compute thresholds
+            train_id2emb = load_id2emb(TRAIN_EMB_CSV)
+            train_ids = list(train_id2emb.keys())
+            train_tgt_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
+            train_tgt_embs = F.normalize(train_tgt_embs, dim=-1)
+            
+            # Encode Train Graphs
+            print("Encoding training graphs for threshold calibration...")
+            train_gnn_embs, _ = encode_graphs(gnn, TRAIN_GRAPHS, device=device, batch_size=args.encode_batch_size)
+            
+            # Leave-one-out KNN
+            sims = train_gnn_embs @ train_tgt_embs.t()
+            n = len(train_ids)
+            mask = torch.eye(n, device=device).bool()
+            sims.masked_fill_(mask, -float('inf'))
+            
+            top_sims, _ = torch.topk(sims, k=args.k, dim=-1)
+            
+            global_thresholds = compute_similarity_thresholds(top_sims)
+            save_thresholds(global_thresholds, THRESHOLDS_PATH)
 
     # If we are NOT training but generating, we load them
     elif args.do_generate:
@@ -1823,28 +2030,63 @@ def main():
 
     if args.do_finetune:
         print("Building KNN dataset (TRAIN)...")
-        knn_ds = build_knn_prompt_dataset(
-            gnn_model=gnn, train_graphs=TRAIN_GRAPHS, train_emb_csv=TRAIN_EMB_CSV, 
-            device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
-            tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
-            max_prompt_length=context_len, max_samples=args.max_train_samples, 
-            leave_one_out=True, desc_key="Train",
-        )
+        if args.base_llm.lower() == 'grale':
+            grale_model, projector_model = load_graph_components(os.path.dirname(grale_paths['grale']))
+            base_llm = grale_model.config.llm_model_path
+        else:
+            base_llm = args.base_llm
+
+        # 1. Define Cache Config for KNN
+        knn_config_dict = {
+            "k": args.k,
+            "thresholds": global_thresholds,
+            "max_samples": args.max_train_samples,
+            "max_prompt_length": context_len,
+            "base_llm": base_llm,
+            "dataset_split": "train"
+        }
         
-        # <--- NEW: Build Validation Dataset for Early Stopping --->
+        # 2. Setup Cache Path (Use base_path so it is shared across experiments)
+        knn_cache_path = str(base_path / f"cache_knn_train_k{args.k}")
+        knn_cacher = SmartCache(knn_cache_path, knn_config_dict)
+
+        # 3. Load or Compute
+        if knn_cacher.is_cached():
+            knn_ds = knn_cacher.load()
+        else:
+            knn_ds = build_knn_prompt_dataset(
+                gnn_model=gnn, train_graphs=TRAIN_GRAPHS, train_emb_csv=TRAIN_EMB_CSV, 
+                device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
+                tokenizer_or_path=base_llm, thresholds=global_thresholds, 
+                max_prompt_length=context_len, max_samples=args.max_train_samples, 
+                leave_one_out=True, desc_key="Train",
+            )
+            knn_cacher.save(knn_ds)
+        
+        # <--- Build Validation Dataset for Early Stopping --->
         knn_val_ds = None
         if args.do_sft and args.sft_early_stopping: 
-            print("Building KNN dataset (VAL) for Early Stopping...")
-            # Note: We use VAL_GRAPHS as the "query", but still retrieve from TRAIN_EMB_CSV
-            knn_val_ds = build_knn_prompt_dataset(
-                gnn_model=gnn, 
-                train_graphs=VAL_GRAPHS,
-                train_emb_csv=TRAIN_EMB_CSV, 
-                device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
-                tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
-                max_prompt_length=context_len, 
-                leave_one_out=True, desc_key="Val",
-            )
+            # Same logic for Val
+            knn_val_config = knn_config_dict.copy()
+            knn_val_config["dataset_split"] = "val"
+            
+            knn_val_cache_path = str(base_path / f"cache_knn_val_k{args.k}")
+            val_cacher = SmartCache(knn_val_cache_path, knn_val_config)
+            
+            if val_cacher.is_cached():
+                knn_val_ds = val_cacher.load()
+            else:
+                print("Building KNN dataset (VAL) for Early Stopping...")
+                knn_val_ds = build_knn_prompt_dataset(
+                    gnn_model=gnn, 
+                    train_graphs=VAL_GRAPHS,
+                    train_emb_csv=TRAIN_EMB_CSV, 
+                    device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
+                    tokenizer_or_path=base_llm, thresholds=global_thresholds, 
+                    max_prompt_length=context_len, 
+                    leave_one_out=True, desc_key="Val",
+                )
+                val_cacher.save(knn_val_ds)
         
         print("Optimizing memory for SFT...")
         
@@ -1865,7 +2107,7 @@ def main():
         # =========================================================
         # [END] MEMORY OPTIMIZATION BLOCK
 
-        llm_dir = args.base_llm
+        llm_dir = base_llm
         if args.do_sft:
             sft_dir = str(base_path / (args.out_llm_dir + "_sft"))
             print(f"Running SFT -> {sft_dir}")
@@ -1874,7 +2116,7 @@ def main():
             neft_alpha = 5.0 if args.sft_neftune else None
 
             llm_dir = sft_finetune_on_knn(
-                base_model_name_or_path=args.base_llm, 
+                base_model_name_or_path=base_llm, 
                 output_dir=sft_dir, 
                 train_dataset=knn_ds, 
                 eval_dataset=knn_val_ds,

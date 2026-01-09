@@ -47,7 +47,7 @@ class GraleConfig:
     hidden_dim: int = 48
     num_layers: int = 4
     num_heads: int = 4
-    dropout: float = 0.1
+    dropout: float = 0.08
     max_nodes: int = 574
     llm_model_path: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     feat_dims: Dict[str, int] = None
@@ -175,7 +175,7 @@ class RichGrALE(nn.Module):
         self.edge_classifiers = nn.ModuleDict({
             k: nn.Sequential(
                 nn.Linear(self.edge_decoder_dim, config.hidden_dim), 
-                nn.ReLU(), 
+                nn.GELU(), 
                 nn.Linear(config.hidden_dim, v)
             ) for k, v in config.feat_dims.items() if k in ['bond_type', 'stereo', 'is_conjugated']
         })
@@ -375,6 +375,7 @@ class GraphAugmentedLLM(nn.Module):
         num_tokens: int = 8,
         lora_r: int = 128,
         lora_alpha: float = None,
+        device=None,
     ):
         super().__init__()
         
@@ -459,6 +460,26 @@ class GraphAugmentedLLM(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.normal_(m.weight, std=0.02)
                     nn.init.zeros_(m.bias)
+        
+        self.generation_config = None
+
+        if device is not None:
+            self.to(device)
+        else:
+            self.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+    @property
+    def device(self):
+        """Mimics HF behavior: returns the device of the underlying LLM."""
+        return self.llm.device
+
+    def to(self, *args, **kwargs):
+        """
+        Ensures all submodules move correctly. 
+        (Standard nn.Module does this, but explicit override ensures consistency if needed)
+        """
+        super().to(*args, **kwargs)
+        return self
 
     def forward(self, input_ids, attention_mask=None, labels=None, graph_data=None, **kwargs):
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
@@ -503,7 +524,8 @@ class GraphAugmentedLLM(nn.Module):
         if graph_data is not None:
             self.graph_encoder.to(target_device)
             self.projector.to(target_device)
-            if hasattr(graph_data, 'to'): graph_data = graph_data.to(target_device)
+            if hasattr(graph_data, 'to'): 
+                graph_data = graph_data.to(target_device)
 
             z_graph, _, _ = self.graph_encoder(graph_data)
             graph_emb = self.projector(z_graph).to(dtype=inputs_embeds.dtype)
@@ -517,6 +539,67 @@ class GraphAugmentedLLM(nn.Module):
                 kwargs['attention_mask'] = attention_mask
             
         return self.llm.generate(inputs_embeds=inputs_embeds, **kwargs)
+
+    def enable_input_require_grads(self):
+        """
+        Enables the gradients for the input embeddings. This is crucial for LoRA/PEFT 
+        when the base model is frozen, otherwise the chain of computation breaks 
+        at the embedding layer.
+        """
+        self.llm.enable_input_require_grads()
+        
+        # We also need to ensure our custom components participate in the backward pass
+        self.graph_encoder.requires_grad_(True)
+        self.projector.requires_grad_(True)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Activates gradient checkpointing for the underlying LLM to save memory.
+        """
+        self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+
+    def print_trainable_parameters(self):
+        """
+        Prints the number of trainable parameters in the wrapper, broken down by component.
+        Verifies that the Hybrid LoRA (LLM) + Full Finetune (Graph) setup is active.
+        """
+        # 1. LLM Params (Should be LoRA only)
+        llm_trainable = 0
+        llm_all = 0
+        for _, param in self.llm.named_parameters():
+            llm_all += param.numel()
+            if param.requires_grad:
+                llm_trainable += param.numel()
+
+        # 2. Graph Encoder Params (Should be 100% trainable)
+        graph_trainable = 0
+        graph_all = 0
+        for _, param in self.graph_encoder.named_parameters():
+            graph_all += param.numel()
+            if param.requires_grad:
+                graph_trainable += param.numel()
+
+        # 3. Projector Params (Should be 100% trainable)
+        proj_trainable = 0
+        proj_all = 0
+        for _, param in self.projector.named_parameters():
+            proj_all += param.numel()
+            if param.requires_grad:
+                proj_trainable += param.numel()
+
+        # 4. Totals
+        total_trainable = llm_trainable + graph_trainable + proj_trainable
+        total_all = llm_all + graph_all + proj_all
+
+        print("\n" + "="*60)
+        print("GraphAugmentedLLM Parameter Breakdown")
+        print("="*60)
+        print(f"LLM (LoRA):      {llm_trainable:>15,} / {llm_all:>15,} ({100 * llm_trainable / llm_all if llm_all else 0:.4f}%)")
+        print(f"Graph Encoder:   {graph_trainable:>15,} / {graph_all:>15,} ({100 * graph_trainable / graph_all if graph_all else 0:.4f}%)")
+        print(f"Projector:       {proj_trainable:>15,} / {proj_all:>15,} ({100 * proj_trainable / proj_all if proj_all else 0:.4f}%)")
+        print("-" * 60)
+        print(f"TOTAL:           {total_trainable:>15,} / {total_all:>15,} || Trainable%: {100 * total_trainable / total_all:.4f}")
+        print("="*60 + "\n")
 
 # =========================================================
 # 4. Save/Load Utilities
@@ -564,7 +647,7 @@ def load_graph_components(save_dir: str, device='cpu') -> Tuple[RichGrALE, Multi
     if not os.path.exists(grale_path):
         raise FileNotFoundError(f"RichGrALE checkpoint not found at {grale_path}")
         
-    grale_ckpt = torch.load(grale_path, map_location=device)
+    grale_ckpt = torch.load(grale_path, map_location=device, weights_only=False)
     grale_model = RichGrALE(grale_ckpt['config'])
     grale_model.load_state_dict(grale_ckpt['state_dict'])
     grale_model.to(device)
@@ -574,7 +657,7 @@ def load_graph_components(save_dir: str, device='cpu') -> Tuple[RichGrALE, Multi
     if not os.path.exists(proj_path):
         raise FileNotFoundError(f"Projector checkpoint not found at {proj_path}")
         
-    proj_ckpt = torch.load(proj_path, map_location=device)
+    proj_ckpt = torch.load(proj_path, map_location=device, weights_only=False)
     projector = MultiTokenProjector(
         input_dim=proj_ckpt['input_dim'],
         output_dim=proj_ckpt['output_dim'],
@@ -640,8 +723,9 @@ def train_grale_scratch(train_pkl_path,
                         output_dir, 
                         epochs=1, 
                         batch_size=16, 
-                        max_step=None,
-                        config_grale={}):
+                        max_steps=None,
+                        config_grale={},
+                        ):
     import torch.optim as optim
     
     # 1. Setup
@@ -688,7 +772,7 @@ def train_grale_scratch(train_pkl_path,
                 )
                 model.train()
 
-            if max_step is not None and step >= max_step:
+            if max_steps is not None and step >= max_steps:
                 break
         # Save checkpoint
         save_graph_components(model, MultiTokenProjector(1,1), output_dir, config.llm_model_path)
@@ -702,7 +786,7 @@ def train_projector_alignment(
     epochs=1, 
     batch_size=8, 
     lr=1e-3, 
-    output_dir="."
+    output_dir=".",
     max_steps=None,
 ):
     import torch.optim as optim
@@ -753,11 +837,12 @@ def train_projector_alignment(
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
 
-            if max_step is not None and step >= max_step:
+            if max_steps is not None and step >= max_steps:
                 break
     
     print("\nSaving Aligned Components...")
-    save_graph_components(model.graph_encoder, model.projector, output_dir, model.llm_model_path)
+    config = model.graph_encoder.config
+    save_graph_components(model.graph_encoder, model.projector, output_dir, config.llm_model_path)
 
     return model
 
@@ -774,6 +859,11 @@ if __name__ == "__main__":
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("-base_llm", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", type=str)
+    parser.add_argument("-steps", default=None, type=int)
+    parser.add_argument("-grale_batch_size", default=16, type=int)
+    parser.add_argument("-grale_epochs", default=2, type=int)
+    parser.add_argument("-proj_batch_size", default=8, type=int)
+    parser.add_argument("-proj_epochs", default=2, type=int)
     args = parser.parse_args()
 
     file_path = Path(os.path.abspath(__file__))
@@ -783,19 +873,23 @@ if __name__ == "__main__":
     os.makedirs(str(base_path), exist_ok=True)
     TRAIN_DATA_PATH = data_path / "train_graphs.pkl"
 
+    MAX_STEPS = args.steps
+
+    LLM_ID = args.base_llm
+    print(f"Using {LLM_ID}")
+
     # 1. Train RichGrALE
     trained_grale = train_grale_scratch(
         train_pkl_path=TRAIN_DATA_PATH,
         output_dir=base_path,
-        epochs=1, 
-        batch_size=16
-        max_steps=50,
+        epochs=args.grale_epochs, 
+        batch_size=args.grale_batch_size,
+        max_steps=MAX_STEPS,
+        config_grale={'llm_model_path':LLM_ID},
     )
 
     # 2. Init LLM
     print("\nInitializing LLM...")
-    LLM_ID = args.base_llm
-    print(f"Using {LLM_ID}")
     tokenizer = AutoTokenizer.from_pretrained(LLM_ID, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -811,17 +905,15 @@ if __name__ == "__main__":
         model=llm_model,
         train_pkl_path=TRAIN_DATA_PATH,
         tokenizer=tokenizer,
-        epochs=1, 
-        batch_size=8,
+        epochs=args.proj_epochs, 
+        batch_size=args.proj_batch_size,
         lr=5e-4, 
-        output_dir=base_path
-        max_steps=50,
+        output_dir=base_path,
+        max_steps=MAX_STEPS,
     )
     
-    # 4. Save Final Components
     
-    
-    # 5. Inference Test
+    # 4. Inference Test
     print("\n--- Running Inference Test ---")
     dataset = GraphPickleDataset(TRAIN_DATA_PATH)
     sample_graph = dataset[0]

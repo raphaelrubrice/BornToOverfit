@@ -2,7 +2,7 @@
 """
 knn_generate.py
 
-kNN + LLM generation with GRPO fine-tuning (TRL).
+kNN + LLM generation with Supervised fine-tuning (and RL possible).
 Optimized for speed by caching token lengths.
 """
 
