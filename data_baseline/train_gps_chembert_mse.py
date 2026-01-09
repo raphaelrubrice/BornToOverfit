@@ -113,7 +113,8 @@ class MolGNN(nn.Module):
             h = conv(h, batch.edge_index, batch.batch, edge_attr=edge_attr)
         
         g = self.pool(h, batch.batch)
-        return self.proj(g)
+        g = self.proj(g)
+        return F.normalize(g, dim=-1)
 
 
 # =========================================================
@@ -130,6 +131,7 @@ def train_epoch(model, loader, optimizer, device):
         text_emb = text_emb.to(device)
         
         graph_emb = model(graphs)
+        text_emb = F.normalize(text_emb, dim=-1)
         loss = F.mse_loss(graph_emb, text_emb)
         
         optimizer.zero_grad()
@@ -154,7 +156,7 @@ def eval_retrieval(model, data_path, emb_dict, device):
     for graphs, text_emb in dl:
         graphs, text_emb = graphs.to(device), text_emb.to(device)
         all_mol.append(model(graphs))
-        all_txt.append(text_emb)
+        all_txt.append(F.normalize(text_emb, dim=-1))
     
     all_mol, all_txt = torch.cat(all_mol), torch.cat(all_txt)
     sims = all_txt @ all_mol.t()
