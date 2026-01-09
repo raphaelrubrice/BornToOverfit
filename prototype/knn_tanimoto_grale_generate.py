@@ -2158,7 +2158,7 @@ def main():
 
         if args.rl_algo is not None:
             print("Running RL fine-tuning...")
-            llm_dir = rl_finetune_on_knn(base_model_name_or_path=llm_dir, output_dir=str((base_path / args.out_llm_dir)), 
+            llm_dir = rl_finetune_on_knn(base_model_name_or_path=llm_dir, output_dir=str((base_path / args.out_llm_dir + "_rl")), 
                                           train_dataset=knn_ds, device=device, rl_algo=args.rl_algo, use_lora=use_lora, 
                                           num_train_steps=args.rl_steps, learning_rate=args.lr, 
                                           per_device_train_batch_size=args.per_device_bs, 
@@ -2167,6 +2167,32 @@ def main():
                                           bf16=False, fp16=torch.cuda.is_available())
 
     if args.do_generate:
+        # --- PATH SELECTION LOGIC ---
+        # 1. Construct potential paths for RL and SFT based on args.out_llm_dir
+        #    Note: args.out_llm_dir is usually just a name like "knn_llm"
+        
+        rl_dir_candidate = base_path / (args.out_llm_dir + "_rl")
+        sft_dir_candidate = base_path / (args.out_llm_dir + "_sft")
+        
+        # 2. Select the best available checkpoint
+        final_model_path = args.out_llm_dir # Default fallback
+        
+        if rl_dir_candidate.exists():
+            print(f"[Generate] Found RL checkpoint at {rl_dir_candidate}. Using it.")
+            final_model_path = str(rl_dir_candidate)
+        elif sft_dir_candidate.exists():
+            print(f"[Generate] RL checkpoint not found, but found SFT checkpoint at {sft_dir_candidate}. Using it.")
+            final_model_path = str(sft_dir_candidate)
+        else:
+            # Check if user provided a full path in args.out_llm_dir that exists
+            user_path_candidate = base_path / args.out_llm_dir
+            if user_path_candidate.exists():
+                 print(f"[Generate] Using user-specified directory: {user_path_candidate}")
+                 final_model_path = str(user_path_candidate)
+            else:
+                 print(f"[Generate] No fine-tuned checkpoints found ({rl_dir_candidate} or {sft_dir_candidate}). using default/base: {final_model_path}")
+
+        # ----------------------------
         if args.split in ("validation", "val"):
             query_graphs = VAL_GRAPHS
             out_csv = str(base_path / f"val_knn_gen_k{args.k}.csv")
@@ -2175,10 +2201,14 @@ def main():
             query_graphs = TEST_GRAPHS
             out_csv = str(base_path / f"test_knn_gen_k{args.k}.csv")
             eval_flag = False
-        llm_path = llm_dir
-        if not os.path.isabs(llm_path):
-            candidate = base_path / llm_path
-            if candidate.exists(): llm_path = str(candidate)
+        
+        # Ensure path resolution
+        llm_path = final_model_path
+        if not os.path.isabs(llm_path) and not os.path.exists(llm_path):
+             # Try resolving relative to base_path if simple name
+             candidate = base_path / llm_path
+             if candidate.exists(): 
+                 llm_path = str(candidate)
         
         # [START] Bring GNN back to GPU
         gnn.to(device) 
