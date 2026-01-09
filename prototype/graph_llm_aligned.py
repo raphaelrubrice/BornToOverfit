@@ -369,7 +369,7 @@ class GraphAugmentedLLM(nn.Module):
     def __init__(
         self, 
         llm_model_path: str, 
-        graph_encoder: Union[RichGrALE, str], 
+        graph_encoder: Union['RichGrALE', str], 
         use_lora: bool = False, 
         projector: Union[nn.Module, str, None] = None,
         num_tokens: int = 8,
@@ -379,149 +379,163 @@ class GraphAugmentedLLM(nn.Module):
     ):
         super().__init__()
         
-        # 1. Load LLM (Auto-detect Architecture)
+        # 1. Load Configuration & Tokenizer
         print(f"Loading LLM: {llm_model_path}")
         config = AutoConfig.from_pretrained(llm_model_path, trust_remote_code=True)
         self.is_encoder_decoder = config.is_encoder_decoder
         
-        # Select appropriate model class
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_model_path, trust_remote_code=True)
+        
+        # 2. Universal Graph Token Setup
+        self.graph_token = "[GRAPH_VECTOR]"
+        self.must_resize = False
+        
+        if self.graph_token not in self.tokenizer.get_vocab():
+            print(f"Adding special token '{self.graph_token}' to tokenizer...")
+            self.tokenizer.add_tokens([self.graph_token], special_tokens=True)
+            self.must_resize = True
+            
+        self.graph_token_id = self.tokenizer.convert_tokens_to_ids(self.graph_token)
+        print(f"Graph Anchor Token: '{self.graph_token}' (ID: {self.graph_token_id})")
+
+        # 3. Load LLM Backbone
         if self.is_encoder_decoder:
             model_cls = AutoModelForSeq2SeqLM
         else:
             model_cls = AutoModelForCausalLM
 
         self.llm = model_cls.from_pretrained(
-            llm_model_path, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16
+            llm_model_path, 
+            trust_remote_code=True, 
+            device_map="auto", 
+            torch_dtype=torch.float16
         )
         
+        if self.must_resize:
+            print(f"Resizing model embeddings to {len(self.tokenizer)}...")
+            self.llm.resize_token_embeddings(len(self.tokenizer))
+
         if use_lora:
             from peft import get_peft_model, LoraConfig
             lora_alpha = lora_r * 2 if lora_alpha is None else lora_alpha
-            # Target modules might need adjustment depending on specific architecture (e.g. T5 vs Llama)
-            peft_config = LoraConfig(r=lora_r, lora_alpha=lora_alpha, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM" if not self.is_encoder_decoder else "SEQ_2_SEQ_LM")
+            peft_config = LoraConfig(
+                r=lora_r, 
+                lora_alpha=lora_alpha, 
+                target_modules=["q_proj", "v_proj"], 
+                task_type="CAUSAL_LM" if not self.is_encoder_decoder else "SEQ_2_SEQ_LM"
+            )
             self.llm = get_peft_model(self.llm, peft_config)
             
-        # 2. Load Graph Encoder
+        # 4. Load Graph Encoder
         if isinstance(graph_encoder, str):
-            print(f"Loading RichGrALE from checkpoint: {graph_encoder}")
-            if not os.path.exists(graph_encoder):
-                raise FileNotFoundError(f"Graph encoder checkpoint not found: {graph_encoder}")
-            
-            # Load checkpoint
             ckpt = torch.load(graph_encoder, map_location='cpu')
-            
-            # Reconstruct Config
-            # Check if 'config' key exists, else assume default GraleConfig
-            config = ckpt.get('config', GraleConfig())
-            
-            # Init Model
-            self.graph_encoder = RichGrALE(config)
-            
-            # Load Weights
-            # Handle case where checkpoint is just state_dict or full dict
-            state_dict = ckpt.get('state_dict', ckpt)
-            self.graph_encoder.load_state_dict(state_dict)
-            
+            from graph_llm_aligned import GraleConfig, RichGrALE 
+            enc_config = ckpt.get('config', GraleConfig())
+            self.graph_encoder = RichGrALE(enc_config)
+            self.graph_encoder.load_state_dict(ckpt['state_dict'] if 'state_dict' in ckpt else ckpt)
         else:
             self.graph_encoder = graph_encoder
 
-        # 3. Load/Init Projector
+        # 5. Load/Init Projector
         if isinstance(projector, str):
-            print(f"Loading Projector from checkpoint: {projector}")
-            if not os.path.exists(projector):
-                raise FileNotFoundError(f"Projector checkpoint not found: {projector}")
-            
             ckpt = torch.load(projector, map_location='cpu')
-            
-            # Required keys for reconstruction
-            if 'input_dim' not in ckpt or 'output_dim' not in ckpt:
-                raise ValueError("Checkpoint missing 'input_dim' or 'output_dim' required to rebuild Projector.")
-            
-            self.projector = MultiTokenProjector(
-                input_dim=ckpt['input_dim'],
-                output_dim=ckpt['output_dim'],
-                num_tokens=ckpt.get('num_tokens', 8)
-            )
+            from graph_llm_aligned import MultiTokenProjector 
+            self.projector = MultiTokenProjector(ckpt['input_dim'], ckpt['output_dim'], ckpt.get('num_tokens', 8))
             self.projector.load_state_dict(ckpt['state_dict'])
-            
         elif projector is not None:
-            print("Using provided Projector module.")
             self.projector = projector
-            
         else:
-            print("Initializing new MultiTokenProjector.")
+            from graph_llm_aligned import MultiTokenProjector
             self.projector = MultiTokenProjector(
                 input_dim=self.graph_encoder.config.hidden_dim, 
                 output_dim=self.llm.config.hidden_size, 
                 num_tokens=num_tokens,
             )
-            # Initialize weights carefully
-            for m in self.projector.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.normal_(m.weight, std=0.02)
-                    nn.init.zeros_(m.bias)
         
+        # Gen config
         self.generation_config = None
 
         if device is not None:
             self.to(device)
-        else:
-            self.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    @property
-    def device(self):
-        """Mimics HF behavior: returns the device of the underlying LLM."""
-        return self.llm.device
+    def _replace_graph_token(self, input_ids, inputs_embeds, graph_emb, attention_mask=None, labels=None):
+        """
+        Splices graph_emb into inputs_embeds AND expands labels/masks accordingly.
+        """
+        is_graph_token = (input_ids == self.graph_token_id)
+        
+        if not is_graph_token.any():
+            return inputs_embeds, attention_mask, labels
 
-    def to(self, *args, **kwargs):
-        """
-        Ensures all submodules move correctly. 
-        (Standard nn.Module does this, but explicit override ensures consistency if needed)
-        """
-        super().to(*args, **kwargs)
-        return self
+        batch_size = inputs_embeds.shape[0]
+        new_embeds_list = []
+        new_mask_list = []
+        new_labels_list = []
+        
+        for i in range(batch_size):
+            indices = torch.nonzero(is_graph_token[i], as_tuple=True)[0]
+            
+            # Case: No graph token in this specific sample
+            if len(indices) == 0:
+                new_embeds_list.append(inputs_embeds[i])
+                if attention_mask is not None:
+                    new_mask_list.append(attention_mask[i])
+                if labels is not None:
+                    new_labels_list.append(labels[i])
+                continue
+
+            # Replace the FIRST occurrence
+            idx = indices[0]
+            
+            # 1. Splice Embeddings
+            combined_emb = torch.cat([
+                inputs_embeds[i, :idx],
+                graph_emb[i],                 
+                inputs_embeds[i, idx+1:]
+            ], dim=0)
+            new_embeds_list.append(combined_emb)
+            
+            # 2. Splice Mask
+            if attention_mask is not None:
+                graph_mask = torch.ones((graph_emb.shape[1],), dtype=attention_mask.dtype, device=attention_mask.device)
+                combined_mask = torch.cat([
+                    attention_mask[i, :idx],
+                    graph_mask,
+                    attention_mask[i, idx+1:]
+                ], dim=0)
+                new_mask_list.append(combined_mask)
+
+            # 3. Splice Labels (CRITICAL FIX)
+            if labels is not None:
+                # We insert -100 (ignore index) for the graph tokens
+                ignore_tokens = torch.full((graph_emb.shape[1],), -100, dtype=labels.dtype, device=labels.device)
+                combined_labels = torch.cat([
+                    labels[i, :idx],
+                    ignore_tokens,
+                    labels[i, idx+1:]
+                ], dim=0)
+                new_labels_list.append(combined_labels)
+
+        from torch.nn.utils.rnn import pad_sequence
+        
+        final_embeds = pad_sequence(new_embeds_list, batch_first=True, padding_value=0.0)
+        
+        final_mask = None
+        if attention_mask is not None:
+            final_mask = pad_sequence(new_mask_list, batch_first=True, padding_value=0)
+            
+        final_labels = None
+        if labels is not None:
+            # Pad labels with -100 so they are ignored in loss
+            final_labels = pad_sequence(new_labels_list, batch_first=True, padding_value=-100)
+            
+        return final_embeds, final_mask, final_labels
 
     def forward(self, input_ids, attention_mask=None, labels=None, graph_data=None, **kwargs):
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
-        target_device = inputs_embeds.device
         
         if graph_data is not None:
-            self.graph_encoder.to(target_device)
-            self.projector.to(target_device)
-            if hasattr(graph_data, 'to'): graph_data = graph_data.to(target_device)
-
-            # 1. Encode Graph -> [Batch, Graph_Dim]
-            z_graph, _, _ = self.graph_encoder(graph_data)
-            
-            # 2. Project -> [Batch, Num_Tokens, LLM_Dim]
-            graph_emb = self.projector(z_graph).to(dtype=inputs_embeds.dtype) 
-            
-            # 3. Prepend -> [Batch, Num_Tokens + Seq_Len, LLM_Dim]
-            inputs_embeds = torch.cat([graph_emb, inputs_embeds], dim=1)
-            
-            # 4. Adjust Mask
-            if attention_mask is not None:
-                # Pad by num_tokens
-                num_tokens = self.projector.num_tokens
-                pad = torch.ones((attention_mask.shape[0], num_tokens), device=target_device, dtype=attention_mask.dtype)
-                attention_mask = torch.cat([pad, attention_mask], dim=1)
-            
-            # 5. Adjust Labels
-            if labels is not None and not self.is_encoder_decoder:
-                num_tokens = self.projector.num_tokens
-                ignore = torch.full((labels.shape[0], num_tokens), -100, device=target_device, dtype=labels.dtype)
-                labels = torch.cat([ignore, labels], dim=1)
-                
-        return self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, **kwargs)
-
-    def generate(self, input_ids, graph_data=None, **kwargs):
-        inputs_embeds = self.llm.get_input_embeddings()(input_ids)
-        target_device = inputs_embeds.device
-        
-        # Handle Attention Mask in kwargs if it exists, as it must match inputs_embeds length
-        attention_mask = kwargs.get('attention_mask', None)
-
-        if graph_data is not None:
+            target_device = inputs_embeds.device
             self.graph_encoder.to(target_device)
             self.projector.to(target_device)
             if hasattr(graph_data, 'to'): 
@@ -529,77 +543,69 @@ class GraphAugmentedLLM(nn.Module):
 
             z_graph, _, _ = self.graph_encoder(graph_data)
             graph_emb = self.projector(z_graph).to(dtype=inputs_embeds.dtype)
-            inputs_embeds = torch.cat([graph_emb, inputs_embeds], dim=1)
+            
+            # --- UPDATED CALL: Pass and receive labels ---
+            inputs_embeds, attention_mask, labels = self._replace_graph_token(
+                input_ids, inputs_embeds, graph_emb, attention_mask, labels
+            )
+            
+        return self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, **kwargs)
 
-            # If an attention mask was provided, we must extend it for generation as well
+    def generate(self, input_ids, graph_data=None, **kwargs):
+        inputs_embeds = self.llm.get_input_embeddings()(input_ids)
+        attention_mask = kwargs.get('attention_mask', None)
+
+        if graph_data is not None:
+            target_device = inputs_embeds.device
+            self.graph_encoder.to(target_device)
+            self.projector.to(target_device)
+            if hasattr(graph_data, 'to'):
+                graph_data = graph_data.to(target_device)
+
+            z_graph, _, _ = self.graph_encoder(graph_data)
+            graph_emb = self.projector(z_graph).to(dtype=inputs_embeds.dtype)
+            
+            # Note: generate doesn't use labels, so we ignore the 3rd return
+            inputs_embeds, attention_mask, _ = self._replace_graph_token(
+                input_ids, inputs_embeds, graph_emb, attention_mask
+            )
+            
             if attention_mask is not None:
-                num_tokens = self.projector.num_tokens
-                pad = torch.ones((attention_mask.shape[0], num_tokens), device=target_device, dtype=attention_mask.dtype)
-                attention_mask = torch.cat([pad, attention_mask], dim=1)
                 kwargs['attention_mask'] = attention_mask
             
         return self.llm.generate(inputs_embeds=inputs_embeds, **kwargs)
 
     def enable_input_require_grads(self):
-        """
-        Enables the gradients for the input embeddings. This is crucial for LoRA/PEFT 
-        when the base model is frozen, otherwise the chain of computation breaks 
-        at the embedding layer.
-        """
         self.llm.enable_input_require_grads()
-        
-        # We also need to ensure our custom components participate in the backward pass
         self.graph_encoder.requires_grad_(True)
         self.projector.requires_grad_(True)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """
-        Activates gradient checkpointing for the underlying LLM to save memory.
-        """
         self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
     def print_trainable_parameters(self):
-        """
-        Prints the number of trainable parameters in the wrapper, broken down by component.
-        Verifies that the Hybrid LoRA (LLM) + Full Finetune (Graph) setup is active.
-        """
-        # 1. LLM Params (Should be LoRA only)
-        llm_trainable = 0
-        llm_all = 0
-        for _, param in self.llm.named_parameters():
-            llm_all += param.numel()
-            if param.requires_grad:
-                llm_trainable += param.numel()
-
-        # 2. Graph Encoder Params (Should be 100% trainable)
-        graph_trainable = 0
-        graph_all = 0
-        for _, param in self.graph_encoder.named_parameters():
-            graph_all += param.numel()
-            if param.requires_grad:
-                graph_trainable += param.numel()
-
-        # 3. Projector Params (Should be 100% trainable)
-        proj_trainable = 0
-        proj_all = 0
-        for _, param in self.projector.named_parameters():
-            proj_all += param.numel()
-            if param.requires_grad:
-                proj_trainable += param.numel()
-
-        # 4. Totals
+        """Prints breakdown of trainable parameters."""
+        llm_trainable = sum(p.numel() for p in self.llm.parameters() if p.requires_grad)
+        llm_all = sum(p.numel() for p in self.llm.parameters())
+        
+        graph_trainable = sum(p.numel() for p in self.graph_encoder.parameters() if p.requires_grad)
+        proj_trainable = sum(p.numel() for p in self.projector.parameters() if p.requires_grad)
+        
         total_trainable = llm_trainable + graph_trainable + proj_trainable
-        total_all = llm_all + graph_all + proj_all
+        total_all = llm_all + sum(p.numel() for p in self.graph_encoder.parameters()) + sum(p.numel() for p in self.projector.parameters())
 
-        print("\n" + "="*60)
-        print("GraphAugmentedLLM Parameter Breakdown")
-        print("="*60)
-        print(f"LLM (LoRA):      {llm_trainable:>15,} / {llm_all:>15,} ({100 * llm_trainable / llm_all if llm_all else 0:.4f}%)")
-        print(f"Graph Encoder:   {graph_trainable:>15,} / {graph_all:>15,} ({100 * graph_trainable / graph_all if graph_all else 0:.4f}%)")
-        print(f"Projector:       {proj_trainable:>15,} / {proj_all:>15,} ({100 * proj_trainable / proj_all if proj_all else 0:.4f}%)")
-        print("-" * 60)
-        print(f"TOTAL:           {total_trainable:>15,} / {total_all:>15,} || Trainable%: {100 * total_trainable / total_all:.4f}")
-        print("="*60 + "\n")
+        print(f"\nGraphAugmentedLLM Trainable Params: {total_trainable:,} / {total_all:,} ({100 * total_trainable / total_all:.4f}%)")
+        print(f"  - LLM (LoRA?): {llm_trainable:,}")
+        print(f"  - GraphEnc:    {graph_trainable:,}")
+        print(f"  - Projector:   {proj_trainable:,}\n")
+        
+    @property
+    def device(self):
+        return self.llm.device
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        return self
 
 # =========================================================
 # 4. Save/Load Utilities
@@ -792,6 +798,7 @@ def train_projector_alignment(
     import torch.optim as optim
     print("\n--- Stage 2: Aligning MultiToken Projector (Graph -> Tokens) ---")
     
+    # 1. Freeze everything except Projector
     model.graph_encoder.eval()
     model.llm.eval()
     for param in model.graph_encoder.parameters(): 
@@ -803,42 +810,126 @@ def train_projector_alignment(
     for param in model.projector.parameters(): 
         param.requires_grad = True
     
+    # 2. Setup Data
     dataset = GraphPickleDataset(train_pkl_path)
+    # Filter for valid descriptions
     dataset.data_list = [d for d in dataset.data_list if hasattr(d, 'description') and d.description]
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=graph_collate_fn)
     
     optimizer = optim.AdamW(model.projector.parameters(), lr=lr)
     device = model.llm.device 
-    step = 0
+    
+    # Retrieve the token string dynamically
+    graph_token = model.graph_token 
+
+    step_count = 0
     for epoch in range(epochs):
         total_loss = 0
         pbar = tqdm(loader, desc=f"Align Epoch {epoch+1}")
+        
         for step, batch in enumerate(pbar):
+            # Extract Data
             descriptions = [g.description for g in batch.to_data_list()]
-            prompts = [f"Describe this molecule:\n{desc}" for desc in descriptions]
+            mol_cards = [g.mol_card for g in batch.to_data_list()]
             
-            tokens = tokenizer(
-                prompts, return_tensors="pt", padding=True, truncation=True, max_length=128
+            # --- 1. Construct Texts with Chat Template ---
+            full_texts = []
+            prompt_texts_for_masking = []
+
+            for card, desc in zip(mol_cards, descriptions):
+                # Construct the User Content containing the Graph Token
+                user_content = f"\n\n[QUERY MOLECULE]\n{graph_token}\nCard: {card}\nDescribe this molecule."
+                
+                # Check for Chat Template
+                if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+                    # Full Conversation: User + Assistant (Target)
+                    full_conv = [
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": desc}
+                    ]
+                    full_text = tokenizer.apply_chat_template(full_conv, tokenize=False)
+                    
+                    # Prompt Only: User + Generation Prompt (for masking)
+                    prompt_conv = [{"role": "user", "content": user_content}]
+                    prompt_text = tokenizer.apply_chat_template(prompt_conv, tokenize=False, add_generation_prompt=True)
+                else:
+                    # Fallback for models without templates
+                    full_text = f"{user_content}\n{desc}"
+                    prompt_text = f"{user_content}\n"
+                
+                full_texts.append(full_text)
+                prompt_texts_for_masking.append(prompt_text)
+            
+            # --- 2. Tokenize & Masking ---
+            original_padding_side = tokenizer.padding_side
+            tokenizer.padding_side = "right"
+            
+            # Tokenize Full Text (add_special_tokens=False because template handles structure usually, 
+            # but we allow tokenizer to add BOS if it detects start)
+            # We follow SFT logic: add_special_tokens=True usually safe with string templates
+            inputs = tokenizer(
+                full_texts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True, 
+                max_length=256,
+                add_special_tokens=True 
             ).to(device)
             
-            labels = tokens.input_ids.clone()
+            labels = inputs.input_ids.clone()
             
+            # Calculate length of the prompt part for masking
+            # We tokenize prompts separately without special tokens to measure length correctly relative to full
+            prompt_tokens = tokenizer(
+                prompt_texts_for_masking, 
+                add_special_tokens=False, # Template string already has tokens, we just want count
+                padding=False,
+                truncation=True,
+                max_length=256
+            )
+            
+            for i, p_ids in enumerate(prompt_tokens['input_ids']):
+                p_len = len(p_ids)
+                
+                # Correction: If full input has BOS but our prompt tokenization didn't add it, offset by 1
+                if tokenizer.bos_token_id is not None and inputs.input_ids[i][0] == tokenizer.bos_token_id:
+                     # Check if our simple tokenization missed the BOS
+                     if len(p_ids) > 0 and p_ids[0] != tokenizer.bos_token_id:
+                         p_len += 1
+
+                # Mask tokens [0 ... p_len]
+                if p_len < labels.shape[1]:
+                    labels[i, :p_len] = -100
+                else:
+                    labels[i, :] = -100
+            
+            # Restore padding side
+            tokenizer.padding_side = original_padding_side
+            
+            # --- 3. Forward Pass ---
             optimizer.zero_grad()
+            
             outputs = model(
-                input_ids=tokens.input_ids,
-                attention_mask=tokens.attention_mask,
-                labels=labels,
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                labels=labels, # Masked labels passed here
                 graph_data=batch.to(device)
             )
+            
             loss = outputs.loss
+            
+            # Backward
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
+            step_count += 1
 
-            if max_steps is not None and step >= max_steps:
+            if max_steps is not None and step_count >= max_steps:
                 break
+        if max_steps is not None and step_count >= max_steps:
+            break
     
     print("\nSaving Aligned Components...")
     config = model.graph_encoder.config
@@ -860,8 +951,10 @@ if __name__ == "__main__":
     parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("-base_llm", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", type=str)
     parser.add_argument("-steps", default=None, type=int)
+    parser.add_argument("-do_grale", action="store_true")
     parser.add_argument("-grale_batch_size", default=16, type=int)
     parser.add_argument("-grale_epochs", default=2, type=int)
+    parser.add_argument("-do_proj", action="store_true")
     parser.add_argument("-proj_batch_size", default=8, type=int)
     parser.add_argument("-proj_epochs", default=2, type=int)
     args = parser.parse_args()
@@ -879,66 +972,90 @@ if __name__ == "__main__":
     print(f"Using {LLM_ID}")
 
     # 1. Train RichGrALE
-    trained_grale = train_grale_scratch(
-        train_pkl_path=TRAIN_DATA_PATH,
-        output_dir=base_path,
-        epochs=args.grale_epochs, 
-        batch_size=args.grale_batch_size,
-        max_steps=MAX_STEPS,
-        config_grale={'llm_model_path':LLM_ID},
-    )
-
-    # 2. Init LLM
-    print("\nInitializing LLM...")
-    tokenizer = AutoTokenizer.from_pretrained(LLM_ID, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    llm_model = GraphAugmentedLLM(
-        llm_model_path=LLM_ID,
-        graph_encoder=trained_grale,
-        use_lora=False 
-    )
-
-    # 3. Align Projector
-    llm_model = train_projector_alignment(
-        model=llm_model,
-        train_pkl_path=TRAIN_DATA_PATH,
-        tokenizer=tokenizer,
-        epochs=args.proj_epochs, 
-        batch_size=args.proj_batch_size,
-        lr=5e-4, 
-        output_dir=base_path,
-        max_steps=MAX_STEPS,
-    )
-    
-    
-    # 4. Inference Test
-    print("\n--- Running Inference Test ---")
-    dataset = GraphPickleDataset(TRAIN_DATA_PATH)
-    sample_graph = dataset[0]
-    
-    if hasattr(sample_graph, 'description'):
-        print(f"Ground Truth: {sample_graph.description}...")
-
-    graph_batch = Batch.from_data_list([sample_graph])
-    device = llm_model.llm.device
-    graph_batch = graph_batch.to(device)
-
-    prompt = "Describe this molecule:\n"
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-    with torch.no_grad():
-        outputs = llm_model.generate(
-            input_ids=inputs.input_ids,
-            graph_data=graph_batch,
-            max_new_tokens=256,
-            do_sample=True,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id
+    if args.do_grale:
+        trained_grale = train_grale_scratch(
+            train_pkl_path=TRAIN_DATA_PATH,
+            output_dir=base_path,
+            epochs=args.grale_epochs, 
+            batch_size=args.grale_batch_size,
+            max_steps=MAX_STEPS,
+            config_grale={'llm_model_path':LLM_ID},
         )
+    else:
+        trained_grale, projector_model = load_graph_components(base_path, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    print("\n--- Model Output (Aligned) ---")
-    print(decoded)
-    print("------------------------------")
+    if args.do_proj:
+        # 2. Init LLM
+        print("\nInitializing LLM...")
+        llm_model = GraphAugmentedLLM(
+            llm_model_path=LLM_ID,
+            graph_encoder=trained_grale,
+            use_lora=False 
+        )
+        
+        # FIX: Use the tokenizer from the model (which has [GRAPH_VECTOR])
+        tokenizer = llm_model.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # 3. Align Projector
+        llm_model = train_projector_alignment(
+            model=llm_model,
+            train_pkl_path=TRAIN_DATA_PATH,
+            tokenizer=tokenizer,
+            epochs=args.proj_epochs, 
+            batch_size=args.proj_batch_size,
+            lr=5e-4, 
+            output_dir=base_path,
+            max_steps=MAX_STEPS,
+        )
+        
+        # 4. Inference Test
+        print("\n--- Running Inference Test ---")
+        dataset = GraphPickleDataset(TRAIN_DATA_PATH)
+        sample_graph = dataset[0]
+        
+        if hasattr(sample_graph, 'description'):
+            print(f"Ground Truth: {sample_graph.description}...")
+
+        graph_batch = Batch.from_data_list([sample_graph])
+        device = llm_model.llm.device
+        graph_batch = graph_batch.to(device)
+
+        # --- FIX 1: Construct Prompt with [GRAPH_VECTOR] ---
+        # --- FIX 2: Use Chat Template to suppress "Thinking" rambling ---
+        user_content = f"\n\n[QUERY MOLECULE]\n[GRAPH_VECTOR]\nCard: {sample_graph.mol_card}\nDescribe this molecule."
+        
+        messages = [{"role": "user", "content": user_content}]
+        
+        # Apply chat template
+        prompt_text = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        print(f"Prompt: {prompt_text}")
+
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs = llm_model.generate(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                graph_data=graph_batch,
+                max_new_tokens=256,
+                do_sample=True,
+                temperature=0.6, 
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Optional: Strip <think> tags if they still appear
+        if "</think>" in decoded:
+            decoded = decoded.split("</think>")[-1].strip()
+            
+        print("\n--- Model Output (Aligned) ---")
+        print(decoded)
+        print("------------------------------")

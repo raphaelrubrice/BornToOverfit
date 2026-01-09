@@ -202,12 +202,7 @@ class SmartCache:
 # Helper: Dynamic Context Length Detection
 # --------------------------------------------------------------------------------------
 def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
-    """
-    Auto-detects context length for standard HF models and GraphAugmentedLLM checkpoints.
-    """
     limit = None
-    
-    # 1. Try Standard Hugging Face Config
     try:
         config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
         possible_limits = [
@@ -221,15 +216,12 @@ def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
         if valid_limits:
             limit = max(valid_limits)
     except Exception:
-        # Not a standard HF config or directory
         pass
 
-    # 2. GrALE Fallback: Inspect checkpoint for backbone
     if limit is None:
         try:
             candidate_pt = None
             if os.path.isdir(model_name_or_path):
-                # Check for standard GrALE checkpoint name
                 pt_path = os.path.join(model_name_or_path, "rich_grale.pt")
                 if os.path.exists(pt_path):
                     candidate_pt = pt_path
@@ -238,27 +230,21 @@ def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
             
             if candidate_pt:
                 print(f" [Context Detection] Inspecting GrALE checkpoint: {candidate_pt}")
-                # Load only the config part if possible, or map to CPU to save memory
-                ckpt = torch.load(candidate_pt, map_location='cpu')
-                
-                # Extract backbone path from GraleConfig
+                # FIX: weights_only=False is required to load custom GraleConfig objects
+                try:
+                    ckpt = torch.load(candidate_pt, map_location='cpu', weights_only=False)
+                except TypeError:
+                    ckpt = torch.load(candidate_pt, map_location='cpu')
+
                 grale_config = ckpt.get('config', None)
-                
                 if grale_config and hasattr(grale_config, 'llm_model_path') and grale_config.llm_model_path:
-                    backbone = grale_config.llm_model_path
-                    print(f" [Context Detection] GrALE Backbone identified: {backbone}")
-                    # Recurse to find the limit of the backbone
-                    return get_safe_context_length(backbone, cap)
+                    return get_safe_context_length(grale_config.llm_model_path, cap)
         except Exception as e:
             print(f" [Context Detection] GrALE inspection failed: {e}")
 
-    # 3. Fallback Default
-    if limit is None:
-        limit = 1024 
+    if limit is None: limit = 1024 
 
-    # 4. Double check with Tokenizer (useful for models like T5/Llama where config might be ambiguous)
     try:
-        # Only attempt if it looks like a valid path or HF ID (avoiding "grale" keyword crashes)
         if os.path.exists(model_name_or_path) or "/" in model_name_or_path:
             tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True, trust_remote_code=True)
             if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 1e9:
@@ -471,6 +457,7 @@ def fit_neighbors_fast(
     
     query_block = (
         "\n\n[QUERY MOLECULE]\n"
+        "[GRAPH_VECTOR]\n"
         f"Card: {query_card.strip() if query_card else 'UNKNOWN'}\n"
     )
     
@@ -1177,9 +1164,12 @@ def sft_finetune_on_knn(
     def _tokenize(ex, is_eval=False):
         prompt_msgs = ex["prompt"]
         ref = ex["reference"] or ""
+        
+        # Helper to render just the prompt (for masking calc)
         prompt_text = _render_prompt_for_sft(tokenizer, prompt_msgs)
 
         if config.is_encoder_decoder or is_eval:
+            # ... (Encoder-Decoder logic unchanged) ...
             model_inputs = tokenizer(
                 prompt_text,
                 max_length=max_prompt_length,
@@ -1194,7 +1184,16 @@ def sft_finetune_on_knn(
             return model_inputs
 
         # CausalLM Training
-        full_text = prompt_text + " " + ref + tokenizer.eos_token
+        # CHANGE: Use apply_chat_template for the FULL text (User + Assistant) if possible
+        if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+             # Construct full conversation object
+             # prompt_msgs is list of dicts. We append the assistant response.
+             full_msgs = prompt_msgs + [{"role": "assistant", "content": ref}]
+             full_text = tokenizer.apply_chat_template(full_msgs, tokenize=False)
+        else:
+             # Fallback: Manual concatenation
+             full_text = prompt_text + " " + ref + tokenizer.eos_token
+        
         full = tokenizer(
             full_text,
             max_length=max_prompt_length + max_completion_length,
@@ -1205,6 +1204,7 @@ def sft_finetune_on_knn(
         input_ids = full["input_ids"]
         labels = input_ids.copy()
 
+        # Calculate prompt length for masking
         prompt_ids = tokenizer(
             prompt_text,
             max_length=max_prompt_length,
@@ -1213,7 +1213,8 @@ def sft_finetune_on_knn(
         )["input_ids"]
         
         prompt_len = len(prompt_ids)
-        if tokenizer.bos_token_id and input_ids[0] == tokenizer.bos_token_id:
+        # Adjust for BOS if the tokenizer added it to input_ids but not prompt_ids
+        if tokenizer.bos_token_id and len(input_ids) > 0 and input_ids[0] == tokenizer.bos_token_id:
             prompt_len += 1
 
         for i in range(min(prompt_len, len(labels))):
@@ -1416,6 +1417,15 @@ def sft_finetune_on_knn(
         # Save components
         print("\nSAVING GRALE")
         save_graph_components(model.graph_encoder, model.projector, output_dir, model.graph_encoder.config.llm_model_path)
+        if use_lora:
+            print("Merging LoRA adapter into LLM for GrALE saving...")
+            # model.llm might be a PeftModel
+            if hasattr(model.llm, "merge_and_unload"):
+                model.llm = model.llm.merge_and_unload()
+            # If strictly using PEFT without direct merge support in wrapper (rare), 
+            # save_pretrained usually saves adapter only. 
+            # But merge_and_unload is standard for CausalLM/Seq2Seq PEFT.
+
         model.llm.save_pretrained(output_dir)
     else:
         if use_lora: 
@@ -1584,32 +1594,28 @@ def generate_desc(
     if is_grale:
         print("Detected GrALE Inference Mode.")
         
-        # 1. Load GrALE Components first to get the Config
+        # 1. Load GrALE Components (Graph Encoder + Projector)
+        # These were saved in the same directory as the LLM during SFT
         grale_model, projector_model = load_graph_components(llm_dir_or_name, device=device)
 
-        # 2. Extract Backbone from Config
-        if hasattr(grale_model.config, 'llm_model_path') and grale_model.config.llm_model_path:
-            llm_backbone = grale_model.config.llm_model_path
-            print(f"Auto-detected LLM Backbone from config: {llm_backbone}")
-        else:
-            raise ValueError(
-                "GrALE config missing 'llm_model_path'. "
-                "Ensure the model was trained/saved with the updated 'save_graph_components' function."
-            )
-
-        # 3. Initialize Augmented Model using the Configured Backbone
+        # 2. Point LLM path directly to the checkpoint directory 
+        # (where save_pretrained was called on the LLM)
+        print(f"Loading Fine-Tuned GraphAugmentedLLM from: {llm_dir_or_name}")
+        
         llm = GraphAugmentedLLM(
-            llm_model_path=llm_backbone,
+            llm_model_path=llm_dir_or_name,  # <--- CRITICAL FIX: Use the checkpoint path
             graph_encoder=grale_model,
             projector=projector_model,
-            use_lora=False 
+            use_lora=False # Assumes LoRA was merged during training save
         )
              
         llm.to(device)
         llm.eval()
         
-        tokenizer = AutoTokenizer.from_pretrained(llm_backbone, use_fast=True)
+        # Load tokenizer from the same checkpoint path
+        tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
         config = llm.llm.config
+        
         try:
             model_max_length = get_safe_context_length(llm_dir_or_name, cap=max_length)
         except NameError:
@@ -1627,20 +1633,18 @@ def generate_desc(
         
         config = AutoConfig.from_pretrained(llm_dir_or_name)
 
-    is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
-    tokenizer.padding_side = "right" if is_seq2seq else "left"
+        is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
+        tokenizer.padding_side = "right" if is_seq2seq else "left"
 
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-    elif torch.cuda.is_available():
-        dtype = torch.float16
-    else:
-        dtype = torch.float32
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        elif torch.cuda.is_available():
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
 
-    model_cls = AutoModelForSeq2SeqLM if is_seq2seq else AutoModelForCausalLM
-    
-    # --- FIX: Ensure we do NOT overwrite GrALE model ---
-    if not is_grale:
+        model_cls = AutoModelForSeq2SeqLM if is_seq2seq else AutoModelForCausalLM
+        
         llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto")
         llm.eval()
     
@@ -1649,6 +1653,10 @@ def generate_desc(
                 llm = torch.compile(llm)
             except Exception:
                 pass
+
+    # Ensure consistent padding side for generation
+    is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
+    tokenizer.padding_side = "right" if is_seq2seq else "left"
 
     print("Loading Data & Caches...")
     train_id2desc = load_descriptions_from_graphs(train_graphs)
@@ -1800,7 +1808,7 @@ def generate_desc(
 
     for start in tqdm(range(0, len(sorted_prompts), gen_batch_size), desc="Generating"):
         batch_prompts = sorted_prompts[start : start + gen_batch_size]
-        batch_ids = sorted_ids[start : start + gen_batch_size] # Get IDs for graph lookup
+        batch_ids = sorted_ids[start : start + gen_batch_size] 
         tokenizer.truncation_side = 'left' 
 
         if use_chat_template:
@@ -1827,7 +1835,7 @@ def generate_desc(
 
         attention_mask = (input_ids != tokenizer.pad_token_id).long()
         
-        # --- FIX: Prepare Graph Batch for GrALE ---
+        # --- Prepare Graph Batch for GrALE ---
         gen_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -1842,12 +1850,9 @@ def generate_desc(
             # 2. Batch them using PyG
             if graphs:
                 batch_graph = Batch.from_data_list(graphs)
-                batch_graph = batch_graph.to(llm.device) # Move to same device as LLM
+                batch_graph = batch_graph.to(llm.device)
                 gen_kwargs["graph_data"] = batch_graph
             else:
-                # If no graphs found (edge case), GrALE might handle None or crash.
-                # Ideally, we pass None and GrALE relies on text only, 
-                # but GraphAugmentedLLM likely expects a tensor.
                 pass 
         # ------------------------------------------
 
@@ -1857,9 +1862,23 @@ def generate_desc(
         if is_seq2seq:
             texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         else:
-            gen_only = outputs[:, input_ids.shape[1] :]
+            if is_grale:
+                # GrALE uses inputs_embeds wrapper, so outputs usually contains ONLY new tokens 
+                # (depending on underlying generate behavior), but typically for CausalLM it appends.
+                # However, GraphAugmentedLLM.generate wraps llm.generate. 
+                # If CausalLM: output is [Prompt + Gen].
+                # If Seq2Seq: output is [Gen].
+                
+                # Check config to be safe
+                if hasattr(llm.llm.config, "is_encoder_decoder") and llm.llm.config.is_encoder_decoder:
+                     gen_only = outputs
+                else:
+                     gen_only = outputs[:, input_ids.shape[1] :]
+            else:
+                gen_only = outputs[:, input_ids.shape[1] :]
+                
             texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
-        
+  
         generations.extend([t.strip() for t in texts])
 
     rows = []
