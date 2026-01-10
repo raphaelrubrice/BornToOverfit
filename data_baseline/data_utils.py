@@ -3,7 +3,7 @@ Data loading and processing utilities for molecule-text retrieval.
 Includes dataset classes and data loading functions.
 """
 from typing import Dict
-import pickle
+import pickle, os
 
 import pandas as pd
 import torch
