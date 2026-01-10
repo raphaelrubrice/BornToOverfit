@@ -21,3 +21,6 @@ ALTEGRAD Molecular Captioning Competition.
 
 ## **Running the KNN approach with the GPS graph encoder + GRALE**
 <a target="_blank" href="https://colab.research.google.com/github/raphaelrubrice/BornToOverfit/blob/raph/GRALE_generate.ipynb"> <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/> </a>  
+
+## **Running the KNN approach with the best GPS graph encoder**
+<a href="https://colab.research.google.com/github/raphaelrubrice/BornToOverfit/blob/raph/Real_CHEMBERT_Validation_GPS.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>  
