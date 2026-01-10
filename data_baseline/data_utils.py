@@ -57,26 +57,44 @@ e_map: Dict[str, List[Any]] = {
 # =========================================================
 # Load precomputed text embeddings
 # =========================================================
-def load_id2emb(csv_path: str) -> Dict[str, torch.Tensor]:
+def load_id2emb(file_path: str) -> Dict[str, torch.Tensor]:
     """
-    Load precomputed text embeddings from CSV file.
+    Load precomputed text embeddings from a CSV or .pt file.
     
     Args:
-        csv_path: Path to CSV file with columns: ID, embedding
-                  where embedding is comma-separated floats
+        file_path: Path to the file.
+                   - If .pt: Expects a dict {'ids': List, 'embeddings': Tensor}
+                   - If .csv: Expects columns 'ID', 'embedding'
         
     Returns:
         Dictionary mapping ID (str) to embedding tensor
     """
-    df = pd.read_csv(csv_path)
-    id2emb = {}
-    for _, row in df.iterrows():
-        id_ = str(row["ID"])
-        emb_str = row["embedding"]
-        emb_vals = [float(x) for x in str(emb_str).split(',')]
-        id2emb[id_] = torch.tensor(emb_vals, dtype=torch.float32)
-    return id2emb
-
+    # Check file extension
+    _, ext = os.path.splitext(file_path)
+    
+    if ext == '.pt':
+        print(f"Loading binary embeddings from {file_path}...")
+        # Load to CPU to avoid CUDA errors if loading on a machine without GPU
+        data = torch.load(file_path, map_location=torch.device('cpu'))
+        
+        # The generation script saves: {'ids': all_ids, 'embeddings': final_embeddings}
+        # final_embeddings is (N, Hidden_Dim). Iterating it yields 1D tensors.
+        id2emb = {
+            str(id_): emb 
+            for id_, emb in zip(data['ids'], data['embeddings'])
+        }
+        return id2emb
+        
+    else:
+        # Fallback to existing CSV logic
+        df = pd.read_csv(file_path)
+        id2emb = {}
+        for _, row in df.iterrows():
+            id_ = str(row["ID"])
+            emb_str = row["embedding"]
+            emb_vals = [float(x) for x in str(emb_str).split(',')]
+            id2emb[id_] = torch.tensor(emb_vals, dtype=torch.float32)
+        return id2emb
 
 # =========================================================
 # Load descriptions from preprocessed graphs
