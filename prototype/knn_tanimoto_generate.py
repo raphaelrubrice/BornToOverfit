@@ -633,7 +633,7 @@ def compute_fingerprints(id2card: Dict[str, str]) -> Dict[str, Any]:
 def build_knn_prompt_dataset(
     gnn_model: nn.Module,
     train_graphs: str,
-    train_emb_csv: str,
+    train_emb: str,
     device: str,
     k: int,
     encode_batch_size: int,
@@ -651,7 +651,7 @@ def build_knn_prompt_dataset(
     else:
         tokenizer = tokenizer_or_path
         
-    train_id2emb = load_id2emb(train_emb_csv)
+    train_id2emb = load_id2emb(train_emb)
     train_ids = list(train_id2emb.keys())
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
@@ -1292,7 +1292,7 @@ def generate_desc(
     llm_dir_or_name: str,
     train_graphs: str,
     query_graphs: str,
-    train_emb_csv: str,
+    train_emb: str,
     device: str,
     k: int,
     out_csv: str,
@@ -1346,7 +1346,7 @@ def generate_desc(
     desc_cache = TokenLengthCache(tokenizer, train_id2desc, "Train Descriptions")
     card_cache = TokenLengthCache(tokenizer, train_id2card, "Train Cards")
 
-    train_id2emb = load_id2emb(train_emb_csv)
+    train_id2emb = load_id2emb(train_emb)
     train_ids = list(train_id2emb.keys())
     train_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
     train_embs = F.normalize(train_embs, dim=-1)
@@ -1557,6 +1557,9 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
+    parser.add_argument("-gnn_path", default=None)
+    parser.add_argument("-train_emb_path", default=None)
+    
     parser.add_argument("--k", default=3, type=int)
     parser.add_argument("--encode_batch_size", default=128, type=int)
     parser.add_argument("--max_train_samples", default=None, type=int)
@@ -1597,8 +1600,14 @@ def main():
     TRAIN_GRAPHS = str(data_path / "train_graphs.pkl")
     VAL_GRAPHS = str(data_path / "validation_graphs.pkl")
     TEST_GRAPHS = str(data_path / "test_graphs.pkl")
-    MODEL_PATH = str(base_path / "model_checkpoint.pt")
-    TRAIN_EMB_CSV = str(base_path / "train_embeddings.csv")
+    if args.gnn_path is not None:
+        MODEL_PATH = str(Path(args.gnn_path).resolve()) # str(base_path / "model_checkpoint.pt")
+    else:
+        MODEL_PATH = str(base_path / "model_checkpoint.pt")
+    if args.train_emb_path is not None:
+        TRAIN_EMB = str(Path(args.train_emb_path).resolve())
+    else:
+        TRAIN_EMB = str(base_path / "train_embeddings.csv")
     THRESHOLDS_PATH = str(base_path / f"sim_thresholds_k{args.k}.json")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1609,7 +1618,7 @@ def main():
     else: 
         context_len = get_safe_context_length(args.base_llm, cap=4096)
 
-    train_id2emb = load_id2emb(TRAIN_EMB_CSV)
+    train_id2emb = load_id2emb(TRAIN_EMB)
     print(f"Loading GNN checkpoint: {MODEL_PATH}")
     gnn = load_gnn_from_checkpoint(model_path=MODEL_PATH, device=device, x_map=x_map, e_map=e_map)
     gnn.eval()
@@ -1630,7 +1639,7 @@ def main():
         
         # We need the training GNN embeddings to compute thresholds
         # (Re-using the logic from build_dataset briefly to get sims)
-        train_id2emb = load_id2emb(TRAIN_EMB_CSV)
+        train_id2emb = load_id2emb(TRAIN_EMB)
         train_ids = list(train_id2emb.keys())
         train_tgt_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
         train_tgt_embs = F.normalize(train_tgt_embs, dim=-1)
@@ -1665,7 +1674,7 @@ def main():
     if args.do_finetune:
         print("Building KNN dataset (TRAIN)...")
         knn_ds = build_knn_prompt_dataset(
-            gnn_model=gnn, train_graphs=TRAIN_GRAPHS, train_emb_csv=TRAIN_EMB_CSV, 
+            gnn_model=gnn, train_graphs=TRAIN_GRAPHS, train_emb=TRAIN_EMB, 
             device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
             tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
             max_prompt_length=context_len, max_samples=args.max_train_samples, 
@@ -1676,11 +1685,11 @@ def main():
         knn_val_ds = None
         if args.do_sft and args.sft_early_stopping: 
             print("Building KNN dataset (VAL) for Early Stopping...")
-            # Note: We use VAL_GRAPHS as the "query", but still retrieve from TRAIN_EMB_CSV
+            # Note: We use VAL_GRAPHS as the "query", but still retrieve from TRAIN_EMB
             knn_val_ds = build_knn_prompt_dataset(
                 gnn_model=gnn, 
                 train_graphs=VAL_GRAPHS, # <--- Use Val graphs here
-                train_emb_csv=TRAIN_EMB_CSV, 
+                train_emb=TRAIN_EMB, 
                 device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
                 tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
                 max_prompt_length=context_len, 
@@ -1764,7 +1773,7 @@ def main():
 
         print(f"Generating with model: {llm_path}")
         generate_desc(gnn_model=gnn, llm_dir_or_name=llm_path, train_graphs=TRAIN_GRAPHS, 
-                      query_graphs=query_graphs, train_emb_csv=TRAIN_EMB_CSV, device=device, 
+                      query_graphs=query_graphs, train_emb=TRAIN_EMB, device=device, 
                       k=args.k, out_csv=out_csv, thresholds=global_thresholds,
                       encode_batch_size=args.encode_batch_size, gen_batch_size=args.gen_batch_size, 
                       max_new_tokens=args.max_new_tokens, evaluate=eval_flag, max_length=context_len)
