@@ -246,7 +246,7 @@ def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
 
     try:
         if os.path.exists(model_name_or_path) or "/" in model_name_or_path:
-            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True, trust_remote_code=True)
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
             if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 1e9:
                 limit = max(limit, tokenizer.model_max_length)
     except Exception:
@@ -448,6 +448,7 @@ def fit_neighbors_fast(
         "1. The [QUERY MOLECULE] Card is the ABSOLUTE GROUND TRUTH.\n"
         "2. If a neighbor contradicts the Query, IGNORE the neighbor.\n"
         "3. Never mention 'Neighbor' or 'Template' in the final output."
+        "4. Think silently. Do not output thought process, only output the description."
     )
     
     # Combine Header
@@ -461,7 +462,7 @@ def fit_neighbors_fast(
         f"Card: {query_card.strip() if query_card else 'UNKNOWN'}\n"
     )
     
-    footer = "**Generate the description strictly adhering to the Guidelines:**"
+    footer = "**Generate the description strictly adhering to the Guidelines and Constraints:**"
 
     # Estimate Overhead
     static_text = system_header + query_block + "\n[STRUCTURAL TEMPLATES]\n[FUNCTIONAL REFERENCE]\n[/CONTEXT]\n" + footer
@@ -752,7 +753,7 @@ def build_knn_prompt_dataset(
     
     # --- 1. Setup & Loading ---
     if isinstance(tokenizer_or_path, str):
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_path, use_fast=True, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_path, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
     else:
         tokenizer = tokenizer_or_path
         
@@ -1067,7 +1068,7 @@ def sft_finetune_on_knn(
         # LLM is already handled by LoRA config inside the wrapper
         
         config = model.llm.config
-        tokenizer = AutoTokenizer.from_pretrained(real_llm_path, use_fast=True, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(real_llm_path, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
         print(f"\n[CHECK] Model: {model}")
         print(f"\n[CHECK] Model class: {type(model)}")
     else:
@@ -1122,7 +1123,7 @@ def sft_finetune_on_knn(
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_name_or_path if not is_grale else model.graph_encoder.config.llm_model_path,
         use_fast=True,
-        trust_remote_code=True
+        trust_remote_code=True, fix_mistral_regex=True
     )
     
     if tokenizer.pad_token is None:
@@ -1462,7 +1463,7 @@ def rl_finetune_on_knn(
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     rl_algo = (rl_algo or "grpo").strip().lower()
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
 
     if tokenizer.pad_token is None: 
         tokenizer.pad_token = tokenizer.eos_token
@@ -1613,7 +1614,8 @@ def generate_desc(
         llm.eval()
         
         # Load tokenizer from the same checkpoint path
-        tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True, 
+                                                trust_remote_code=True, fix_mistral_regex=True)
         config = llm.llm.config
         
         try:
@@ -1628,7 +1630,8 @@ def generate_desc(
         except NameError:
             model_max_length = 2048
 
-        tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True, 
+                                                trust_remote_code=True, fix_mistral_regex=True)
         if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
         
         config = AutoConfig.from_pretrained(llm_dir_or_name)
@@ -1863,20 +1866,17 @@ def generate_desc(
             texts = tokenizer.batch_decode(outputs, skip_special_tokens=True)
         else:
             if is_grale:
-                # GrALE uses inputs_embeds wrapper, so outputs usually contains ONLY new tokens 
-                # (depending on underlying generate behavior), but typically for CausalLM it appends.
-                # However, GraphAugmentedLLM.generate wraps llm.generate. 
-                # If CausalLM: output is [Prompt + Gen].
-                # If Seq2Seq: output is [Gen].
-                
-                # Check config to be safe
-                if hasattr(llm.llm.config, "is_encoder_decoder") and llm.llm.config.is_encoder_decoder:
-                     gen_only = outputs
+                # GraphAugmentedLLM may return either:
+                #  (A) full sequences: [prompt + gen]  OR
+                #  (B) gen-only sequences (e.g., some inputs_embeds paths)
+                # Slice only when the output is longer than the prompt.
+                if outputs.shape[1] > input_ids.shape[1]:
+                    gen_only = outputs[:, input_ids.shape[1]:]
                 else:
-                     gen_only = outputs[:, input_ids.shape[1] :]
+                    gen_only = outputs
             else:
-                gen_only = outputs[:, input_ids.shape[1] :]
-                
+                gen_only = outputs[:, input_ids.shape[1]:]
+
             texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
   
         generations.extend([t.strip() for t in texts])

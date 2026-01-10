@@ -384,7 +384,7 @@ class GraphAugmentedLLM(nn.Module):
         config = AutoConfig.from_pretrained(llm_model_path, trust_remote_code=True)
         self.is_encoder_decoder = config.is_encoder_decoder
         
-        self.tokenizer = AutoTokenizer.from_pretrained(llm_model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_model_path, trust_remote_code=True, fix_mistral_regex=True)
         
         # 2. Universal Graph Token Setup
         self.graph_token = "[GRAPH_VECTOR]"
@@ -553,27 +553,28 @@ class GraphAugmentedLLM(nn.Module):
 
     def generate(self, input_ids, graph_data=None, **kwargs):
         inputs_embeds = self.llm.get_input_embeddings()(input_ids)
-        attention_mask = kwargs.get('attention_mask', None)
+        attention_mask = kwargs.get("attention_mask", None)
 
         if graph_data is not None:
             target_device = inputs_embeds.device
             self.graph_encoder.to(target_device)
             self.projector.to(target_device)
-            if hasattr(graph_data, 'to'):
+            if hasattr(graph_data, "to"):
                 graph_data = graph_data.to(target_device)
 
             z_graph, _, _ = self.graph_encoder(graph_data)
             graph_emb = self.projector(z_graph).to(dtype=inputs_embeds.dtype)
-            
+
             # Note: generate doesn't use labels, so we ignore the 3rd return
             inputs_embeds, attention_mask, _ = self._replace_graph_token(
                 input_ids, inputs_embeds, graph_emb, attention_mask
             )
-            
-            if attention_mask is not None:
-                kwargs['attention_mask'] = attention_mask
-            
-        return self.llm.generate(inputs_embeds=inputs_embeds, **kwargs)
+
+        if attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask
+
+        # IMPORTANT: pass input_ids as well so downstream code can safely slice prompt vs gen
+        return self.llm.generate(input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs)
 
     def enable_input_require_grads(self):
         self.llm.enable_input_require_grads()
@@ -598,7 +599,7 @@ class GraphAugmentedLLM(nn.Module):
         print(f"  - LLM (LoRA?): {llm_trainable:,}")
         print(f"  - GraphEnc:    {graph_trainable:,}")
         print(f"  - Projector:   {proj_trainable:,}\n")
-        
+
     @property
     def device(self):
         return self.llm.device
