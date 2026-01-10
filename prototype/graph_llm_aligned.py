@@ -950,7 +950,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
-    parser.add_argument("-base_llm", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", type=str)
+    parser.add_argument("-base_llm", default="Qwen/Qwen2.5-1.5B-Instruct", type=str)
     parser.add_argument("-steps", default=None, type=int)
     parser.add_argument("-do_grale", action="store_true")
     parser.add_argument("-grale_batch_size", default=16, type=int)
