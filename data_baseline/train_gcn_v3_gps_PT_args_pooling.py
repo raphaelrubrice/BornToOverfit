@@ -5,6 +5,7 @@ train_gcn_v3_gps_PT_args.py - Version avec choix de Pooling via CLI
 import os
 import argparse
 from pathlib import Path
+import re
 
 import torch
 import torch.nn as nn
@@ -14,11 +15,19 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
 from torch_geometric.nn import GPSConv, GINEConv, global_add_pool, global_mean_pool, global_max_pool
 
-from data_utils import (
-    load_id2emb,
-    PreprocessedGraphDataset, collate_fn,
-    x_map, e_map
-)
+try:
+    from data_utils import (
+        load_id2emb,
+        PreprocessedGraphDataset, collate_fn,
+        x_map, e_map
+    )
+
+except ImportError:
+    from .data_utils import (
+        load_id2emb,
+        PreprocessedGraphDataset, collate_fn,
+        x_map, e_map
+    )
 
 # =========================================================
 # HELPER: CHARGEMENT INTELLIGENT (.pt ou .csv)
@@ -104,7 +113,7 @@ class BondEncoder(nn.Module):
 # =========================================================
 # MODEL: GPS Transformer avec Pooling Variable
 # =========================================================
-class MolGNN(nn.Module):
+class MolGNN_GPS_pooling(nn.Module):
     def __init__(self, hidden_dim=256, out_dim=768, 
                  num_layers=4, num_heads=4, dropout=0.1, 
                  pooling='sum'):
@@ -229,6 +238,101 @@ def eval_retrieval(data_path, emb_dict, mol_enc, device):
         results[f"R@{k}"] = (pos <= k).float().mean().item()
     return results
 
+def parse_checkpoint_name(filename):
+    """
+    Parse le nom du checkpoint pour extraire la config.
+    
+    Supporte plusieurs formats :
+    - kaggle_model_v3_gps_triplet_margin0.2_bs128_lr0.0008_hd256_nl4.pt
+    - model_v3_gps_triplet_pool_sum_hd256_nl4_drop0.1_heads4.pt
+    
+    Args:
+        filename: Nom du fichier .pt
+    
+    Returns:
+        dict: Configuration du modèle
+    """
+    config = {
+        'pooling': 'sum',        # Default (si absent)
+        'hidden_dim': 256,       # Default
+        'num_layers': 4,         # Default
+        'num_heads': 4,          # Default
+        'dropout': 0.1,          # Default
+        'out_dim': 768,          # Fixe (ChemBERT)
+    }
+    
+    # ===== POOLING =====
+    if 'pool_all' in filename:
+        config['pooling'] = 'all'
+    elif 'pool_mean' in filename:
+        config['pooling'] = 'mean'
+    elif 'pool_max' in filename:
+        config['pooling'] = 'max'
+    elif 'pool_sum' in filename:
+        config['pooling'] = 'sum'
+    # Sinon garde le default 'sum'
+    
+    # ===== HIDDEN DIM =====
+    match = re.search(r'hd(\d+)', filename)
+    if match:
+        config['hidden_dim'] = int(match.group(1))
+    
+    # ===== NUM LAYERS =====
+    match = re.search(r'nl(\d+)', filename)
+    if match:
+        config['num_layers'] = int(match.group(1))
+    
+    # ===== DROPOUT =====
+    match = re.search(r'drop([\d.]+)', filename)
+    if match:
+        config['dropout'] = float(match.group(1))
+    # Sinon garde le default 0.1
+    
+    # ===== NUM HEADS =====
+    match = re.search(r'heads(\d+)', filename)
+    if match:
+        config['num_heads'] = int(match.group(1))
+    # Sinon garde le default 4
+    
+    return config
+
+def load_molgnn_gps_pooling_from_checkpoint(
+    model_path: str,
+    device: str,
+    **kwargs, # NOT USED, for compatibility
+):
+    """
+    Load MolGNN using a saved config + state_dict.
+    """
+    model_filename = model_path.split("/")[-1]
+    
+    # FIX: Correct variable name
+    print("FILENAME", model_filename)
+    
+    cfg = parse_checkpoint_name(model_filename)
+    print("CFG", cfg)
+    
+    model_class = cfg.get("model_class", "MolGNN_GPS_pooling")
+    print("MODEL CLASS", model_class)
+    
+    if model_class not in ["MolGNN", "MolGNN_GPS_pooling"]:
+        raise ValueError(f"Unsupported GNN class: {model_class}")
+    
+    # FIX: Provide defaults for missing constants
+    gnn = MolGNN_GPS_pooling(
+        hidden_dim=cfg.get("hidden_dim", 256), 
+        out_dim=cfg.get("out_dim", 768), 
+        num_layers=cfg.get("num_layers", 4),
+        num_heads=cfg.get("num_heads", 4),
+        dropout=cfg.get("dropout", 0.1),
+        pooling=cfg.get("pooling", "sum")
+    ).to(device)
+
+    state = torch.load(model_path, map_location=device)
+    gnn.load_state_dict(state)
+    gnn.eval()
+
+    return gnn
 
 def main():
     # =========================================================
@@ -273,7 +377,6 @@ def main():
 
     TRAIN_GRAPHS = str(base_path / "train_graphs.pkl")
     VAL_GRAPHS   = str(base_path / "validation_graphs.pkl")
-    # TEST_GRAPHS  = str(base_path / "test_graphs.pkl") # Pas utilisé en train
 
     TRAIN_EMB_PATH = str(base_path / "train_embeddings_RealChemBERT.pt")
     VAL_EMB_PATH   = str(base_path / "validation_embeddings_RealChemBERT.pt")
@@ -307,7 +410,7 @@ def main():
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
     # Initialisation du modèle avec l'argument pooling
-    mol_enc = MolGNN(
+    mol_enc = MolGNN_GPS_pooling(
         hidden_dim=args.hidden_dim, 
         out_dim=emb_dim, 
         num_layers=args.num_layers,

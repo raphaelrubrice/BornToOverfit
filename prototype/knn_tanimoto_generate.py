@@ -75,9 +75,11 @@ from data_baseline.data_utils import (
 )
 from data_baseline.train_gcn import MolGNN, load_molgnn_from_checkpoint
 from data_baseline.train_gcn_v3_gps import MolGNN_GPS, load_molgnn_gps_from_checkpoint
+from data_baseline.train_gcn_v3_gps_PT_args_pooling import MolGNN_GPS_pooling, load_molgnn_gps_pooling_from_checkpoint
 
 SUPPORTED_GNNS = {"MolGNN":load_molgnn_from_checkpoint, 
-                "MolGNN_GPS":load_molgnn_gps_from_checkpoint}
+                "MolGNN_GPS":load_molgnn_gps_from_checkpoint,
+                "MolGNN_GPS_pooling":load_molgnn_gps_pooling_from_checkpoint}
 
 _EVAL_AVAILABLE = True
 try:
@@ -160,7 +162,7 @@ def prompt_as_chat(prompt_text: str) -> List[Dict[str, str]]:
 # --------------------------------------------------------------------------------------
 # GNN encoding + KNN retrieval
 # --------------------------------------------------------------------------------------
-GNN_LOADING_FUNCS = [load_molgnn_from_checkpoint,load_molgnn_gps_from_checkpoint]
+GNN_LOADING_FUNCS = [load_molgnn_from_checkpoint,load_molgnn_gps_from_checkpoint,load_molgnn_gps_pooling_from_checkpoint]
 
 def load_gnn_from_checkpoint(*args, **kwargs):
     for func in GNN_LOADING_FUNCS:
@@ -258,6 +260,7 @@ def get_closeness_tag(sim: float, thresholds: List[float]) -> str:
     else: return "[VERY_DISTANT]"
 
 def save_thresholds(thresholds: List[float], path: str):
+    os.makedirs(str(Path(path).parent), exist_ok=True)
     with open(path, 'w') as f:
         json.dump(thresholds, f)
     print(f"Saved similarity thresholds to {path}: {thresholds}")
@@ -1559,7 +1562,7 @@ def main():
     parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("-gnn_path", default=None)
     parser.add_argument("-train_emb_path", default=None)
-    
+
     parser.add_argument("--k", default=3, type=int)
     parser.add_argument("--encode_batch_size", default=128, type=int)
     parser.add_argument("--max_train_samples", default=None, type=int)
