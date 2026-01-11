@@ -317,7 +317,7 @@ def load_molgnn_gps_pooling_from_checkpoint(
     
     if model_class not in ["MolGNN", "MolGNN_GPS_pooling"]:
         raise ValueError(f"Unsupported GNN class: {model_class}")
-    
+    print("Instantiating..")
     # FIX: Provide defaults for missing constants
     gnn = MolGNN_GPS_pooling(
         hidden_dim=cfg.get("hidden_dim", 256), 
@@ -327,9 +327,15 @@ def load_molgnn_gps_pooling_from_checkpoint(
         dropout=cfg.get("dropout", 0.1),
         pooling=cfg.get("pooling", "sum")
     ).to(device)
-
-    state = torch.load(model_path, map_location=device)
-    gnn.load_state_dict(state)
+    print("Loading..")
+    state = torch.load(model_path, map_location=device, weights_only=False)
+    print("State loaded", state.keys())
+    print("Moving into class..")
+    try:
+        gnn.load_state_dict(state)
+    except Exception as e:
+        print(e)
+        raise Exception("Error occured")
     gnn.eval()
 
     return gnn
