@@ -287,61 +287,30 @@ def fit_neighbors_fast(
 ) -> str:
     """
     Constructs a Dynamic Prompt that guarantees Structure and Function context.
-    Adapts instructions based on neighbor quality (High vs Low Similarity).
+    
+    UPDATES:
+    1. Uses a unified 'Caution' based system prompt to prevent hallucinations.
+    2. Prioritizes budget for the Top 2 Structural AND Top 2 Functional neighbors 
+       before filling the rest of the context window.
     """
     
-    # --- 1. Analyze Neighbor Quality ---
-    # Defaults
-    struct_is_strong = False
-    func_is_strong = False
-
-    # Check Structural Quality (Threshold: 0.5 Tanimoto)
-    if struct_neighbors:
-        best_struct_score = struct_neighbors[0]['score']
-        struct_is_strong = best_struct_score >= 0.5
-
-    # Check Functional Quality (Threshold: 0.75 Cosine - distinct from GNN retrieval threshold)
-    if func_neighbors:
-        best_func_score = func_neighbors[0]['score']
-        func_is_strong = best_func_score >= 0.75
-    
-    # --- 2. Dynamic System Header Construction ---
-    
+    # --- 1. Static System Header (Always Cautious) ---
     intro = "You are an expert chemist. Generate a factual description of the [QUERY MOLECULE] strictly based on its feature card."
     
-    # Condition A: Structural Instructions
-    if struct_is_strong:
-        struct_instr = (
-            "You are provided with **[STRUCTURAL TEMPLATES]** (high similarity). "
-            "Use them to determine the sentence structure, IUPAC nomenclature style, and scaffold description. "
-            "Update specific atoms/groups to match the [QUERY MOLECULE] Card."
-        )
-    else:
-        # Low confidence fallback
-        struct_instr = (
-            "**CAUTION: DISTANT STRUCTURAL MATCH ONLY.** "
-            "The available [STRUCTURAL TEMPLATE] is not a close match. "
-            "Use it **ONLY** for formatting and sentence flow. "
-            "Do NOT infer chemical properties or scaffold details from it. Rely strictly on the Query Card."
-        )
+    struct_instr = (
+        "**[STRUCTURAL TEMPLATES]:** "
+        "Use these molecules to determine sentence structure, IUPAC nomenclature style, and general scaffold description. "
+        "**CAUTION:** Even if high similarity, specific atoms or groups may differ. "
+        "Do NOT infer chemical properties (e.g., bond counts, specific substituents) from templates unless they exist in the Query Card."
+    )
 
-    # Condition B: Functional Instructions
-    if func_is_strong:
-        func_instr = (
-            "You are provided with **[FUNCTIONAL REFERENCES]**. "
-            "Use them to identify potential abstract biomedical roles (e.g., 'anti-bacterial', 'metabolite'). "
-            "**NEVER** copy physical numbers (Mass, Spin) from them."
-        )
-    else:
-        # Low confidence fallback
-        func_instr = (
-            "**CAUTION: DISTANT FUNCTIONAL REFERENCE.** "
-            "The [FUNCTIONAL REFERENCE] is chemically distant. "
-            "It is likely NOT bio-active in the same way. "
-            "Avoid inferring specific biological roles unless supported by the structure."
-        )
+    func_instr = (
+        "**[FUNCTIONAL REFERENCES]:** "
+        "Use these to identify potential abstract biomedical roles (e.g., 'anti-bacterial', 'metabolite'). "
+        "**CAUTION:** These may be chemically distant. "
+        "**NEVER** copy physical numbers (Mass, Spin) or specific bio-activity data unless supported by the [QUERY MOLECULE] structure."
+    )
 
-    # Global Constraints
     constraints = (
         "**Strict Constraints:**\n"
         "1. The [QUERY MOLECULE] Card is the ABSOLUTE GROUND TRUTH.\n"
@@ -349,11 +318,9 @@ def fit_neighbors_fast(
         "3. Never mention 'Neighbor' or 'Template' in the final output."
     )
     
-    # Combine Header
     system_header = f"{intro}\n\n**Context Guidelines:**\n* {struct_instr}\n* {func_instr}\n\n{constraints}"
 
-    # --- 3. Construct Body ---
-    
+    # --- 2. Construct Body Shell ---
     query_block = (
         "\n\n[QUERY MOLECULE]\n"
         f"Card: {query_card.strip() if query_card else 'UNKNOWN'}\n"
@@ -361,62 +328,87 @@ def fit_neighbors_fast(
     
     footer = "**Generate the description strictly adhering to the Guidelines:**"
 
-    # Estimate Overhead
-    static_text = system_header + query_block + "\n[STRUCTURAL TEMPLATES]\n[FUNCTIONAL REFERENCE]\n[/CONTEXT]\n" + footer
+    # --- 3. Budget Calculation ---
+    # Estimate Base Cost
+    # We add placeholders for section headers to ensure we don't overestimate available space
+    static_text = system_header + query_block + "\n[CONTEXT]\n[STRUCTURAL TEMPLATES]\n[FUNCTIONAL REFERENCE]\n[/CONTEXT]\n" + footer
     base_len = len(tokenizer.encode(static_text, add_special_tokens=False))
     remaining_budget = max_length - base_len - 20 
 
-    # --- 4. Fill Context (Structure First) ---
-    struct_text_list = []
-    if struct_neighbors:
-        struct_text_list.append("\n[STRUCTURAL TEMPLATES]")
-        for i, n in enumerate(struct_neighbors, 1):
-            score_display = f"{n['score']:.2f}"
-            c = n['card']
-            d = n['desc']
-            nid = n['id']
-            
-            # Cost: Card + Desc + Overhead
-            c_len = card_cache.get_len(nid)
-            d_len = desc_cache.get_len(nid)
-            overhead = 25 
-            
-            if (c_len + d_len + overhead) <= remaining_budget:
-                entry = (
-                    f"\n> Template {i} (Tanimoto: {score_display}):\n"
-                    f"Card: {c.strip()}\n"
-                    f"Description: {d.strip()}"
-                )
-                struct_text_list.append(entry)
-                remaining_budget -= (c_len + d_len + overhead)
-            else:
-                break
+    # --- 4. Selection Logic (Priority: Top 2 Struct -> Top 2 Func -> Rest) ---
+    selected_struct_indices = []
+    selected_func_indices = []
+
+    # Helper to calculate cost
+    def get_struct_cost(n):
+        return card_cache.get_len(n['id']) + desc_cache.get_len(n['id']) + 25 # +25 for overhead chars
     
-    # --- 5. Fill Context (Function Second) ---
-    func_text_list = []
-    # Always attempt to add at least one functional neighbor if it exists, even if budget is tight
-    if func_neighbors and remaining_budget > 40:
-        func_text_list.append("\n\n[FUNCTIONAL REFERENCE]")
-        for i, n in enumerate(func_neighbors, 1):
-            score_display = f"{n['score']:.2f}"
-            d = n['desc']
-            nid = n['id']
+    def get_func_cost(n):
+        return desc_cache.get_len(n['id']) + 20 # +20 for overhead chars
+
+    # A. Mandatory Allocation (Top 2 of each)
+    # We try to fit the first 2 of both categories first.
+    
+    # 1. Top 2 Struct
+    for i in range(min(2, len(struct_neighbors))):
+        cost = get_struct_cost(struct_neighbors[i])
+        if cost <= remaining_budget:
+            selected_struct_indices.append(i)
+            remaining_budget -= cost
+
+    # 2. Top 2 Func
+    for i in range(min(2, len(func_neighbors))):
+        cost = get_func_cost(func_neighbors[i])
+        if cost <= remaining_budget:
+            selected_func_indices.append(i)
+            remaining_budget -= cost
             
-            # Cost: Desc ONLY (Card Hidden)
-            d_len = desc_cache.get_len(nid)
-            overhead = 20
-            
-            if (d_len + overhead) <= remaining_budget:
-                entry = (
-                    f"\n> Ref {i} (Cosine: {score_display}):\n"
-                    f"Description: {d.strip()}"
-                )
-                func_text_list.append(entry)
-                remaining_budget -= (d_len + overhead)
+    # B. Optional Allocation (Fill remaining with rest)
+    
+    # 3. Remaining Struct
+    if len(struct_neighbors) > 2:
+        for i in range(2, len(struct_neighbors)):
+            cost = get_struct_cost(struct_neighbors[i])
+            if cost <= remaining_budget:
+                selected_struct_indices.append(i)
+                remaining_budget -= cost
+            else:
+                break # Stop if we hit limit (preserve order)
+
+    # 4. Remaining Func
+    if len(func_neighbors) > 2:
+        for i in range(2, len(func_neighbors)):
+            cost = get_func_cost(func_neighbors[i])
+            if cost <= remaining_budget:
+                selected_func_indices.append(i)
+                remaining_budget -= cost
             else:
                 break
 
-    # --- 6. Final Assembly ---
+    # --- 5. Final Text Assembly ---
+    struct_text_list = []
+    if selected_struct_indices:
+        struct_text_list.append("\n[STRUCTURAL TEMPLATES]")
+        for i in selected_struct_indices:
+            n = struct_neighbors[i]
+            entry = (
+                f"\n> Template {i+1} (Tanimoto: {n['score']:.2f}):\n"
+                f"Card: {n['card'].strip()}\n"
+                f"Description: {n['desc'].strip()}"
+            )
+            struct_text_list.append(entry)
+
+    func_text_list = []
+    if selected_func_indices:
+        func_text_list.append("\n\n[FUNCTIONAL REFERENCE]")
+        for i in selected_func_indices:
+            n = func_neighbors[i]
+            entry = (
+                f"\n> Ref {i+1} (Cosine: {n['score']:.2f}):\n"
+                f"Description: {n['desc'].strip()}"
+            )
+            func_text_list.append(entry)
+
     context_section = ""
     if struct_text_list or func_text_list:
         context_section = "\n[CONTEXT]" + "".join(struct_text_list) + "".join(func_text_list) + "\n[/CONTEXT]\n"
@@ -677,8 +669,10 @@ def build_knn_prompt_dataset(
             if j is not None:
                 mask_self[i, j] = True
 
-    # Retrieve slightly more GNN neighbors than K to handle overlap filtering
-    top_idx_gnn, top_sims_gnn = knn_topk(train_gnn_embs, train_embs, k=k+5, mask_self=mask_self)
+    # Retrieve slightly more GNN neighbors than K to ensure we find non-structural ones
+    # We want to be able to fill at least 2 functional slots + extras
+    search_k = max(k + 10, 20)
+    top_idx_gnn, top_sims_gnn = knn_topk(train_gnn_embs, train_embs, k=search_k, mask_self=mask_self)
     ref_threshold = thresholds[1]
     top_idx_gnn = top_idx_gnn.cpu().tolist()
     top_sims_gnn = top_sims_gnn.cpu().tolist()
@@ -698,10 +692,6 @@ def build_knn_prompt_dataset(
     desc_cache = TokenLengthCache(tokenizer, train_id2desc, f"{desc_key} Descriptions")
     card_cache = TokenLengthCache(tokenizer, train_id2card, f"{desc_key} Cards")
     
-    # Ratios
-    k_struct = max(1, int(k * 0.8)) 
-    k_func = max(1, k - k_struct)
-
     n = len(train_ids_ordered)
     if max_samples is not None:
         n = min(n, int(max_samples))
@@ -721,16 +711,17 @@ def build_knn_prompt_dataset(
                     t_sims[self_idx] = -1.0
             
             t_sims_np = np.array(t_sims)
-            # Get Candidates
-            top_struct_indices = np.argsort(t_sims_np)[-k_struct:][::-1]
+            # Retrieve enough candidates to filter
+            top_struct_indices = np.argsort(t_sims_np)[-search_k:][::-1]
             
             for rank, idx in enumerate(top_struct_indices):
                 score = t_sims_np[idx]
                 nid = train_ids[idx]
                 
-                # FORCE INCLUSION for the absolute best match (Rank 0)
-                # FILTER others by threshold 0.5
-                if rank == 0 or score > 0.5:
+                # Logic: ALWAYS take Top 2 (Rank 0 and 1). 
+                # Afterwards, only take if score > 0.5.
+                # Stop if we have gathered enough (e.g. k+2 to give buffer)
+                if rank < 2 or score > 0.5:
                     struct_neighbors.append({
                         "id": nid,
                         "desc": train_id2desc.get(nid, ""),
@@ -738,6 +729,9 @@ def build_knn_prompt_dataset(
                         "score": score,
                         "type": "STRUCTURAL"
                     })
+                
+                if len(struct_neighbors) >= k + 2:
+                    break
         
         # --- B. Retrieve Functional Neighbors (GNN) ---
         func_neighbors = []
@@ -746,30 +740,19 @@ def build_knn_prompt_dataset(
         
         struct_nids = set(n['id'] for n in struct_neighbors)
         
-        # First pass: try to find good matches
+        # Logic: ALWAYS take Top 2 valid GNN matches (Rank 0 and 1 logic relative to filtered list).
+        # Then take others if score >= ref_threshold.
+        
+        found_count = 0
         for j, idx in enumerate(gnn_indices):
-            if len(func_neighbors) >= k_func:
-                break
             nid = train_ids[idx]
             score = sim_neighbors[j]
             
-            # Normal logic: score >= threshold
-            if nid not in struct_nids and score >= ref_threshold:
-                func_neighbors.append({
-                    "id": nid,
-                    "desc": train_id2desc.get(nid, ""),
-                    "card": train_id2card.get(nid, ""), 
-                    "score": score, 
-                    "type": "FUNCTIONAL"
-                })
-
-        # FALLBACK: If no functional neighbors found (because all were < threshold),
-        # force the best non-structural one from the list.
-        if not func_neighbors:
-            for j, idx in enumerate(gnn_indices):
-                nid = train_ids[idx]
-                score = sim_neighbors[j]
-                if nid not in struct_nids:
+            if nid not in struct_nids:
+                # Is this one of the first 2 valid functional neighbors?
+                is_mandatory = (found_count < 2)
+                
+                if is_mandatory or score >= ref_threshold:
                     func_neighbors.append({
                         "id": nid,
                         "desc": train_id2desc.get(nid, ""),
@@ -777,7 +760,10 @@ def build_knn_prompt_dataset(
                         "score": score, 
                         "type": "FUNCTIONAL"
                     })
-                    break # Only add one forced fallback
+                    found_count += 1
+            
+            if len(func_neighbors) >= k + 2:
+                break
 
         # --- C. Construct Hybrid Prompt ---
         query_card = train_id2card.get(qid, "")
