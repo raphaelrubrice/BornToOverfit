@@ -3,7 +3,7 @@ import os
 import sys
 import torch
 import pandas as pd
-from typing import Dict, List, Union
+from typing import Dict
 
 def load_embeddings(path: str) -> Dict[str, torch.Tensor]:
     """
@@ -19,8 +19,6 @@ def load_embeddings(path: str) -> Dict[str, torch.Tensor]:
     id2emb = {}
 
     if ext == '.pt':
-        # Load binary PyTorch file
-        # Expects dict: {'ids': List[str], 'embeddings': torch.Tensor}
         data = torch.load(path, map_location='cpu')
         
         if 'ids' not in data or 'embeddings' not in data:
@@ -38,8 +36,6 @@ def load_embeddings(path: str) -> Dict[str, torch.Tensor]:
             id2emb[str(doc_id)] = embs[i]
 
     else:
-        # Fallback to CSV
-        # Expects columns: ID, embedding (comma-separated string)
         try:
             df = pd.read_csv(path)
         except Exception as e:
@@ -55,25 +51,56 @@ def load_embeddings(path: str) -> Dict[str, torch.Tensor]:
             doc_id = str(row['ID'])
             emb_str = row['embedding']
             try:
-                # Convert "0.1, 0.2, ..." string to tensor
                 emb_vals = [float(x) for x in str(emb_str).split(',')]
                 id2emb[doc_id] = torch.tensor(emb_vals, dtype=torch.float32)
             except ValueError:
-                print(f"Warning: Could not parse embedding for ID {doc_id}. Skipping.")
                 continue
 
     print(f" -> Loaded {len(id2emb)} embeddings.")
     return id2emb
+
+def get_max_id_from_dict(emb_dict: Dict[str, torch.Tensor]) -> int:
+    """Finds the maximum integer ID in the keys of an embedding dictionary."""
+    max_id = -1
+    for k in emb_dict.keys():
+        try:
+            val = int(k)
+            if val > max_id:
+                max_id = val
+        except ValueError:
+            continue
+    return max_id
+
+def reindex_embeddings(emb_dict: Dict[str, torch.Tensor], offset: int) -> Dict[str, torch.Tensor]:
+    """
+    Creates a new dictionary where keys are shifted by the offset.
+    Matches the logic used in the graph merge script.
+    """
+    print(f"Re-indexing {len(emb_dict)} validation embeddings with offset +{offset}...")
+    new_dict = {}
+    for k, v in emb_dict.items():
+        try:
+            current_id = int(k)
+            new_id = current_id + offset
+            new_dict[str(new_id)] = v
+        except ValueError:
+            # Fallback for non-numeric IDs matches graph script fallback
+            new_key = f"{k}_{offset}"
+            new_dict[new_key] = v
+            
+    return new_dict
 
 def save_embeddings(merged_dict: Dict[str, torch.Tensor], output_path: str, format_type: str):
     """
     Saves the merged dictionary to disk in the requested format.
     """
     ids = list(merged_dict.keys())
-    # Ensure deterministic order
-    ids.sort()
+    # Sort numerically if possible to keep things tidy
+    try:
+        ids.sort(key=lambda x: int(x))
+    except ValueError:
+        ids.sort()
     
-    # Stack tensors
     embs_list = [merged_dict[i] for i in ids]
     if not embs_list:
         print("Error: No embeddings to save.")
@@ -91,10 +118,8 @@ def save_embeddings(merged_dict: Dict[str, torch.Tensor], output_path: str, form
         torch.save(save_data, output_path)
         
     elif format_type == 'csv':
-        # Convert tensors back to comma-separated strings
         emb_strings = []
         for emb in embs_list:
-            # .tolist() converts tensor to list of floats
             s = ",".join(map(str, emb.tolist()))
             emb_strings.append(s)
             
@@ -108,7 +133,7 @@ def save_embeddings(merged_dict: Dict[str, torch.Tensor], output_path: str, form
         sys.exit(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="Merge train and validation embedding files (CSV or PT).")
+    parser = argparse.ArgumentParser(description="Merge train and validation embedding files with re-indexing.")
     parser.add_argument("--train_path", type=str, required=True, help="Path to training embeddings")
     parser.add_argument("--val_path", type=str, required=True, help="Path to validation embeddings")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the output file")
@@ -121,28 +146,30 @@ def main():
     train_embs = load_embeddings(args.train_path)
     val_embs = load_embeddings(args.val_path)
 
-    # 2. Check for Overlaps
-    train_ids = set(train_embs.keys())
-    val_ids = set(val_embs.keys())
+    # 2. Calculate Offset (Must match graph script logic)
+    max_train_id = get_max_id_from_dict(train_embs)
+    offset = max_train_id + 1
     
-    overlap = train_ids.intersection(val_ids)
-    if overlap:
-        print(f"\nError: Found {len(overlap)} overlapping IDs between files.")
-        print(f"Sample overlapping IDs: {list(overlap)[:5]}")
-        print("Merging aborted to prevent data leakage.")
-        sys.exit(1)
-    else:
-        print("\n -> No ID overlaps found. Safe to merge.")
+    print(f"Max Train ID found: {max_train_id}. Offset calculated: {offset}")
 
-    # 3. Merge
-    # Dictionary unpacking merges them (since we proved disjoint keys, order doesn't impact overwrites)
-    merged_embs = {**train_embs, **val_embs}
+    # 3. Re-index Validation Embeddings
+    val_embs_reindexed = reindex_embeddings(val_embs, offset)
+
+    # 4. Merge
+    # We update a copy of train_embs with the new val items
+    merged_embs = train_embs.copy()
+    
+    # Check for collisions before blind update (sanity check)
+    overlaps = set(merged_embs.keys()).intersection(set(val_embs_reindexed.keys()))
+    if overlaps:
+        print(f"CRITICAL ERROR: {len(overlaps)} ID collisions detected even after re-indexing.")
+        sys.exit(1)
+        
+    merged_embs.update(val_embs_reindexed)
     print(f"Merged {len(train_embs)} + {len(val_embs)} = {len(merged_embs)} total embeddings.")
 
-    # 4. Save
+    # 5. Save
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Determine filename based on format
     filename = f"train_val_embeddings.{args.output_format}"
     output_path = os.path.join(args.output_dir, filename)
     
