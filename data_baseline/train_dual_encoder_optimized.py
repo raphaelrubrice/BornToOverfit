@@ -3,6 +3,7 @@ import os
 import argparse
 import pickle
 import json
+import shutil
 from pathlib import Path
 import numpy as np
 
@@ -167,11 +168,31 @@ def evaluate_retrieval(model, val_loader, device):
 
     return {'MRR': mrr, 'R@1': r1, 'R@5': r5, 'R@10': r10}
 
+# --- BACKUP FONCTION ---
+def backup_to_drive(file_path, drive_backup_dir):
+    """Copie automatique d'un fichier vers Google Drive"""
+    if not Path('/content/drive/MyDrive').exists():
+        return  # Drive non monté, on skip
+    
+    try:
+        drive_dir = Path(drive_backup_dir)
+        drive_dir.mkdir(parents=True, exist_ok=True)
+        
+        dest_path = drive_dir / Path(file_path).name
+        shutil.copy2(file_path, dest_path)
+        
+        size_mb = Path(file_path).stat().st_size / (1024**2)
+        print(f"  ☁️ Backup Drive: {Path(file_path).name} ({size_mb:.1f} MB)")
+    except Exception as e:
+        print(f"  ⚠️ Backup Drive échoué: {e}")
+
 # --- MAIN ---
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default='data_baseline/data')
     parser.add_argument('--model_name', type=str, default='recobo/chemical-bert-uncased')
+    parser.add_argument('--drive_backup_dir', type=str, default='/content/drive/MyDrive/dual_encoder_checkpoints',
+                       help='Répertoire Google Drive pour backup automatique')
 
     # Paramètres à varier
     parser.add_argument('--lr_gnn', type=float, default=8e-4)
@@ -193,11 +214,18 @@ def main():
     args = parser.parse_args()
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Vérifier si Drive est monté
+    drive_available = Path('/content/drive/MyDrive').exists()
+    
     mode_str = "FINAL (train+val)" if args.final_training else "NORMAL (train → val)"
     print("=" * 70)
     print(f"🚀 DUAL ENCODER TRAINING - {mode_str}")
     print("=" * 70)
     print(f"Device      : {DEVICE}")
+    if drive_available:
+        print(f"☁️ Google Drive: MONTÉ ({args.drive_backup_dir})")
+    else:
+        print(f"⚠️ Google Drive: NON MONTÉ (backup désactivé)")
     print(f"LR GNN      : {args.lr_gnn}")
     print(f"LR BERT     : {args.lr_bert}")
     print(f"Weight Decay: {args.weight_decay}")
@@ -351,14 +379,20 @@ def main():
                             f"wd{args.weight_decay}_frz{args.freeze_layers}_"
                             f"margin{args.margin}_bs{effective_bs}.pt")
 
+                checkpoint_path = Path(args.data_dir) / save_name
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'args': vars(args),
                     'best_mrr': best_mrr,
                     'epoch': epoch + 1
-                }, Path(args.data_dir) / save_name)
+                }, checkpoint_path)
 
                 print(f"  💾 New Best MRR: {best_mrr:.4f} | Saved: {save_name}")
+                
+                # Backup sur Drive
+                if drive_available:
+                    backup_to_drive(checkpoint_path, args.drive_backup_dir)
+                    
             else:
                 patience_counter += 1
                 if patience_counter >= args.patience:
@@ -382,24 +416,35 @@ def main():
                             f"wd{args.weight_decay}_frz{args.freeze_layers}_"
                             f"margin{args.margin}_bs{effective_bs}_ep{epoch+1}.pt")
 
+                checkpoint_path = Path(args.data_dir) / save_name
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'args': vars(args),
                     'epoch': epoch + 1,
                     'train_loss': avg_loss
-                }, Path(args.data_dir) / save_name)
+                }, checkpoint_path)
 
                 print(f"  💾 Checkpoint sauvegardé : {save_name}")
+                
+                # Backup sur Drive
+                if drive_available:
+                    backup_to_drive(checkpoint_path, args.drive_backup_dir)
         
         # Sauvegarder les logs à chaque epoch
         with open(log_file, 'w') as f:
             json.dump(training_logs, f, indent=2)
+        
+        # Backup du log sur Drive tous les 10 epochs
+        if drive_available and ((epoch + 1) % 10 == 0 or epoch == args.epochs - 1):
+            backup_to_drive(log_file, args.drive_backup_dir)
     
     print("\n" + "=" * 70)
     print("✅ Entraînement terminé !")
     print(f"📝 Logs sauvegardés dans : {log_file}")
     if val_loader is not None:
         print(f"🏆 Meilleur MRR : {best_mrr:.4f}")
+    if drive_available:
+        print(f"☁️ Backups disponibles sur : {args.drive_backup_dir}")
     print("=" * 70)
 
 if __name__ == "__main__":
