@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 
 import numpy as np
 import pandas as pd
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +26,7 @@ from torch.utils.data import DataLoader
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 
 from transformers import (
     AutoTokenizer,
@@ -50,6 +51,8 @@ from trl import (
     GRPOConfig,
     PPOTrainer,
     PPOConfig,
+    DPOTrainer, 
+    DPOConfig,
     AutoModelForCausalLMWithValueHead,
     AutoModelForSeq2SeqLMWithValueHead,
 )
@@ -851,6 +854,36 @@ def _render_prompt_for_sft(tokenizer, prompt_messages: List[Dict[str, str]]) -> 
     return "\n".join(parts)
 
 class CausalSeq2SeqTrainer(Seq2SeqTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.get("labels")
+        # Forward pass
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        
+        # Standard Cross Entropy (element-wise)
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        
+        # Shift tokens for Causal LM (predict next token)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        # Flatten to [batch * seq_len, vocab_size]
+        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        shift_labels = shift_labels.view(-1)
+        
+        # Calculate raw Cross Entropy
+        ce_loss = loss_fct(shift_logits, shift_labels)
+        
+        # Focal Loss: (1 - p_t)^gamma * log(p_t)
+        gamma = 2.0
+        pt = torch.exp(-ce_loss) # probability of the true class
+        focal_loss = ((1 - pt) ** gamma) * ce_loss
+        
+        # Average over non-ignored tokens
+        loss = focal_loss.mean()
+        
+        return (loss, outputs) if return_outputs else loss
+    
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """
         Custom prediction step for Causal LMs (Decoder-Only) in Seq2SeqTrainer.
@@ -1323,8 +1356,211 @@ def sft_finetune_on_knn(
 #     return output_dir
 
 # --------------------------------------------------------------------------------------
-# RL fine-tuning (GRPO)
+# RL fine-tuning (DPO or GRPO)
 # --------------------------------------------------------------------------------------
+def dpo_finetune_on_knn(
+    base_model_name_or_path: str,
+    output_dir: str,
+    train_dataset: Dataset,
+    device: str,
+    tokenizer,  # Pass the tokenizer object
+    knn_ds_with_neighbors, # We need the dataset that has the 'nn_ids' or neighbor info
+    max_prompt_length: int = 1024,
+    max_completion_length: int = 192,
+    num_train_steps: int = 1000,
+    learning_rate: float = 5e-6,
+    per_device_train_batch_size: int = 2,
+    gradient_accumulation_steps: int = 4,
+    lora_r: int = 128,
+    use_lora: bool = True,
+    bf16: bool = False,
+    fp16: bool = True,
+    gen_subset_size: int = 2000, # 2k samples for generation
+    cache_dir: str = "dpo_cache",
+    seed: int = 42
+) -> str:
+    print(f"\n[DPO] Starting Hybrid DPO Fine-tuning...")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # --- 1. Dataset Construction / Caching ---
+    dpo_dataset_path = os.path.join(cache_dir, f"dpo_hybrid_{gen_subset_size}_{seed}")
+    
+    if os.path.exists(dpo_dataset_path):
+        print(f"[DPO] Found cached dataset at {dpo_dataset_path}. Loading...")
+        dpo_dataset = load_from_disk(dpo_dataset_path)
+    else:
+        print(f"[DPO] No cache found. constructing Hybrid DPO dataset...")
+        
+        # A. Split indices into "Generation Set" and "KNN Set"
+        total_len = len(train_dataset)
+        all_indices = list(range(total_len))
+        random.seed(seed)
+        random.shuffle(all_indices)
+        
+        gen_indices = all_indices[:gen_subset_size]
+        knn_indices = all_indices[gen_subset_size:]
+        
+        dpo_data = []
+        
+        # --- B. Generation Phase (The "LIMA" Subset) ---
+        print(f"[DPO] Generating rejected samples for {len(gen_indices)} items (this may take a while)...")
+        
+        # Setup model for generation
+        model_kwargs = {"trust_remote_code": True, "attn_implementation": "flash_attention_2" if bf16 else None}
+        dtype = torch.bfloat16 if bf16 else torch.float16
+        
+        # Load model temporarily for generation
+        gen_model = AutoModelForCausalLM.from_pretrained(base_model_name_or_path, torch_dtype=dtype, **model_kwargs).to(device)
+        gen_model.eval()
+        
+        # Select the subset
+        gen_subset = train_dataset.select(gen_indices)
+        
+        # We process in chunks to be safe
+        batch_size = 32 
+        
+        for start_idx in tqdm(range(0, len(gen_indices), batch_size), desc="DPO Generation"):
+            batch = gen_subset.select(range(start_idx, min(start_idx + batch_size, len(gen_indices))))
+            
+            # Prepare prompts
+            batch_prompts = []
+            for item in batch:
+                # Convert chat list to string
+                if isinstance(item["prompt"], list):
+                    prompt_str = tokenizer.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
+                else:
+                    prompt_str = item["prompt"]
+                batch_prompts.append(prompt_str)
+            
+            inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_length).to(device)
+            
+            with torch.no_grad():
+                # Generate with high repetition penalty to see what the model "naturally" wants to do
+                # But actually, we want the "bad" behavior (loops) to reject it. 
+                # So we use standard decoding (no penalty) to capture the model's current bad habits.
+                outputs = gen_model.generate(
+                    **inputs, 
+                    max_new_tokens=max_completion_length, 
+                    do_sample=True, 
+                    temperature=0.7
+                )
+            
+            # Extract generated text
+            gen_texts = tokenizer.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+            
+            for i, generated in enumerate(gen_texts):
+                original_item = batch[i]
+                
+                # Check for identity
+                if generated.strip() == original_item["reference"].strip():
+                    continue # Skip if identical
+                
+                dpo_data.append({
+                    "prompt": batch_prompts[i],
+                    "chosen": original_item["reference"],
+                    "rejected": generated
+                })
+
+        del gen_model
+        torch.cuda.empty_cache()
+
+        # --- C. KNN Negative Phase (The "Rest") ---
+        print(f"[DPO] Constructing KNN negatives for {len(knn_indices)} items...")
+        
+        # We need access to neighbors. Assuming 'knn_ds_with_neighbors' has this info.
+        # If 'train_dataset' was built by 'build_knn_prompt_dataset', we need to look back at how we stored neighbor info.
+        # NOTE: In your original code, 'build_knn_prompt_dataset' puts the neighbors into the prompt string.
+        # We need to extract the "Top 1 Structural Neighbor" description.
+        
+        # Helper to extract neighbor desc from prompt text
+        def extract_first_neighbor_desc(prompt_text):
+            # Look for "> Template 1" or similar markers you used in 'fit_neighbors_fast'
+            # Format: "> Template 1 ... Description: [TEXT]"
+            match = re.search(r"> Template 1.*?Description:\s*(.*?)(?=\n>|\n\[|\Z)", prompt_text, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+            return None
+
+        knn_subset = train_dataset.select(knn_indices)
+        
+        for item in tqdm(knn_subset, desc="KNN Negatives"):
+            prompt_str = tokenizer.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
+            chosen = item["reference"]
+            
+            # Extract neighbor description from the prompt itself
+            rejected = extract_first_neighbor_desc(prompt_str)
+            
+            # Fallback: If no structural neighbor found, skip or use a random string? 
+            # Better to skip to keep quality high.
+            if rejected and rejected != chosen:
+                dpo_data.append({
+                    "prompt": prompt_str,
+                    "chosen": chosen,
+                    "rejected": rejected
+                })
+
+        # --- D. Save ---
+        print(f"[DPO] Final Dataset Size: {len(dpo_data)} pairs")
+        dpo_dataset = Dataset.from_list(dpo_data)
+        dpo_dataset.save_to_disk(dpo_dataset_path)
+
+    # --- 2. Load Model for Training ---
+    print(f"[DPO] Loading model for training...")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_name_or_path,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float16,
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2" if bf16 else None
+    )
+    
+    # DPO Configuration
+    # We use beta=0.1 (standard)
+    training_args = DPOConfig(
+        output_dir=output_dir,
+        beta=0.1,
+        learning_rate=learning_rate,
+        max_steps=num_train_steps,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=True,
+        bf16=bf16,
+        fp16=fp16,
+        max_prompt_length=max_prompt_length,
+        max_length=max_prompt_length + max_completion_length,
+        max_target_length=max_completion_length,
+        remove_unused_columns=False,
+        report_to="none"
+    )
+    
+    # Peft Config
+    peft_config = None
+    if use_lora:
+        peft_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_r * 2,
+            target_modules="all-linear",
+            task_type="CAUSAL_LM",
+            bias="none",
+            lora_dropout=0.05
+        )
+
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=None, # DPO trainer creates a copy implicitly or uses PEFT adapter as 'active' and base as 'ref'
+        args=training_args,
+        train_dataset=dpo_dataset,
+        tokenizer=tokenizer,
+        peft_config=peft_config
+    )
+    
+    print("[DPO] Training...")
+    trainer.train()
+    
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    
+    return output_dir
+
 def rl_finetune_on_knn(
     base_model_name_or_path: str,
     output_dir: str,
@@ -1640,6 +1876,7 @@ def generate_desc(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,       
         num_beams=1,
+        repetition_penalty=1.2,
         temperature=temperature,
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
@@ -1758,7 +1995,7 @@ def main():
     parser.add_argument("--rl_steps", default=300, type=int)
     # [UPDATED] Added bf16 argument for L4/A100 optimization
     parser.add_argument("--bf16", action="store_true", help="Enable bfloat16 (Required for L4/A100)")
-    parser.add_argument("--lr", default=0.5e-6, type=float)
+    parser.add_argument("--lr", default=2e-6, type=float)
     parser.add_argument("--per_device_bs", default=2, type=int)
     parser.add_argument("--grad_accum", default=4, type=int)
     parser.add_argument("--num_generations", default=4, type=int)
@@ -1917,26 +2154,51 @@ def main():
                 neftune_noise_alpha=neft_alpha
             )
 
+        # if args.rl_algo is not None:
+        #     print("Running RL fine-tuning...")
+        #     # [UPDATED CALL] Correct arguments for the new function signature
+        #     llm_dir = rl_finetune_on_knn(
+        #         base_model_name_or_path=llm_dir, 
+        #         output_dir=str((base_path / args.out_llm_dir)), 
+        #         train_dataset=knn_ds, 
+        #         device=device, 
+        #         rl_algo=args.rl_algo, 
+        #         use_lora=use_lora, 
+        #         num_train_steps=args.rl_steps, 
+        #         learning_rate=args.lr, 
+        #         per_device_train_batch_size=args.per_device_bs, 
+        #         gradient_accumulation_steps=args.grad_accum, 
+        #         max_prompt_length=context_len, 
+        #         max_completion_length=args.max_new_tokens, # Pass this!
+        #         num_generations=args.num_generations, 
+        #         bf16=args.bf16, # Pass the argument
+        #         fp16=(not args.bf16 and torch.cuda.is_available()),
+        #         # removed bert_reward_batch_size
+        #     )
         if args.rl_algo is not None:
-            print("Running RL fine-tuning...")
-            # [UPDATED CALL] Correct arguments for the new function signature
-            llm_dir = rl_finetune_on_knn(
-                base_model_name_or_path=llm_dir, 
-                output_dir=str((base_path / args.out_llm_dir)), 
-                train_dataset=knn_ds, 
-                device=device, 
-                rl_algo=args.rl_algo, 
-                use_lora=use_lora, 
-                num_train_steps=args.rl_steps, 
-                learning_rate=args.lr, 
-                per_device_train_batch_size=args.per_device_bs, 
-                gradient_accumulation_steps=args.grad_accum, 
-                max_prompt_length=context_len, 
-                max_completion_length=args.max_new_tokens, # Pass this!
-                num_generations=args.num_generations, 
-                bf16=args.bf16, # Pass the argument
+            # We are hijacking the 'rl_algo' flag to run DPO now
+            print("Switching to Hybrid DPO strategy...")
+            
+            # Load tokenizer explicitly here to pass it
+            tokenizer = AutoTokenizer.from_pretrained(llm_dir, trust_remote_code=True)
+            
+            llm_dir = dpo_finetune_on_knn(
+                base_model_name_or_path=llm_dir,
+                output_dir=str((base_path / args.out_llm_dir) + "_dpo"),
+                train_dataset=knn_ds,
+                device=device,
+                tokenizer=tokenizer,
+                knn_ds_with_neighbors=None, # Not needed as we extract from prompt text
+                max_prompt_length=context_len,
+                max_completion_length=args.max_new_tokens,
+                num_train_steps=args.rl_steps,
+                learning_rate=args.lr,
+                per_device_train_batch_size=args.per_device_bs,
+                gradient_accumulation_steps=args.grad_accum,
+                use_lora=use_lora,
+                bf16=args.bf16,
                 fp16=(not args.bf16 and torch.cuda.is_available()),
-                # removed bert_reward_batch_size
+                gen_subset_size=2000 # Configurable
             )
 
     if args.do_generate:
