@@ -991,7 +991,8 @@ def sft_finetune_on_knn(
     model = model_cls.from_pretrained(
         base_model_name_or_path,
         dtype=dtype,
-        device_map="auto"
+        device_map="auto",
+        attn_implementation="flash_attention_2" if bf16 else None
     )
     model.gradient_checkpointing_enable()
 
@@ -1731,13 +1732,14 @@ def generate_desc(
 
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16
+        bf16 = True
     elif torch.cuda.is_available():
         dtype = torch.float16
     else:
         dtype = torch.float32
 
     model_cls = AutoModelForSeq2SeqLM if is_seq2seq else AutoModelForCausalLM
-    llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto")
+    llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto", attn_implementation="flash_attention_2" if bf16 else None)
     llm.eval()
     
     if hasattr(torch, "compile") and os.name != "nt":
@@ -1876,7 +1878,6 @@ def generate_desc(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,       
         num_beams=1,
-        repetition_penalty=1.2,
         temperature=temperature,
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
