@@ -141,7 +141,7 @@ def get_safe_context_length(model_name_or_path: str, cap: int = 4096) -> int:
         limit = max(valid_limits) if valid_limits else 1024 
         
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
             if hasattr(tokenizer, "model_max_length") and tokenizer.model_max_length < 1e9:
                 limit = max(limit, tokenizer.model_max_length)
         except Exception:
@@ -574,45 +574,51 @@ from collections import Counter
 
 class BLEUReward:
     def __init__(self):
-        # We use sacrebleu for standard BLEU computation
         import sacrebleu
         self.metric = sacrebleu
+        # FIX 1: GRPOTrainer requires the object to have a __name__
+        self.__name__ = "bleu_reward"
 
     def __call__(self, prompts, completions, **kwargs):
-        """
-        GRPO calls this with:
-          prompts: list[str] (The context fed to the model)
-          completions: list[str] (The generated text)
-          **kwargs: Contains 'reference' from the dataset if available
-        """
-        # 1. Extract References from the dataset (passed via kwargs)
-        # GRPOTrainer passes the batch columns in kwargs.
-        # We expect a list of reference strings.
+        # kwargs contains the dataset columns. 'reference' is usually a list of strings.
         references = kwargs.get("reference", None)
         
-        if references is None:
-            # Fallback: If 'reference' isn't passed, check if it's inside 'prompts' logic 
-            # (unlikely in standard TRL usage, so we return 0.0 to avoid crash)
+        if not references:
             return [0.0] * len(completions)
+
+        # FIX 2: Handle Dimension Mismatch
+        # GRPO generates N completions per prompt. 
+        # But 'references' usually only has 1 per prompt. We must duplicate them.
+        if len(completions) > len(references) and len(references) > 0:
+            # Check if it's a clean multiple (it should be)
+            if len(completions) % len(references) == 0:
+                factor = len(completions) // len(references)
+                # Expand: [RefA, RefB] -> [RefA, RefA, RefA, RefA, RefB, RefB, RefB, RefB]
+                # GRPO usually groups completions by prompt: [P1_G1, P1_G2... P2_G1...]
+                expanded_refs = []
+                for r in references:
+                    expanded_refs.extend([r] * factor)
+                references = expanded_refs
 
         rewards = []
         for pred, ref in zip(completions, references):
-            # 2. Compute Sentence BLEU
-            # We assume 'ref' is a string. Sacrebleu expects a list of references.
-            if not pred.strip():
-                rewards.append(-1.0) # Penalize empty
+            pred_clean = pred.strip().lower()
+            ref_clean = ref.strip().lower()
+            
+            if not pred_clean:
+                rewards.append(0.0)
                 continue
-                
-            # Score is 0-100
-            score = self.metric.sentence_bleu(pred.lower(), [ref.lower()]).score
             
-            # 3. Scale to 0-1 range for RL stability
-            # We add a tiny length penalty to prevent 'short gaming' if BLEU matches just 1 word
-            len_ratio = len(pred) / max(1, len(ref))
-            len_penalty = 1.0
-            if len_ratio < 0.3: len_penalty = 0.5
+            # BLEU score (0-100 -> 0.0-1.0)
+            score = self.metric.sentence_bleu(pred_clean, [ref_clean]).score / 100.0
             
-            rewards.append((score / 100.0) * len_penalty)
+            # Tiny length penalty to avoid gaming (e.g. just outputting "the")
+            len_ratio = len(pred_clean) / max(1, len(ref_clean))
+            penalty = 1.0
+            if len_ratio < 0.2: penalty = 0.1
+            elif len_ratio > 2.0: penalty = 0.8
+            
+            rewards.append(score * penalty)
             
         return rewards
 
@@ -690,7 +696,7 @@ def build_knn_prompt_dataset(
     
     # --- 1. Setup & Loading ---
     if isinstance(tokenizer_or_path, str):
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_path, use_fast=True, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_or_path, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
     else:
         tokenizer = tokenizer_or_path
         
@@ -968,8 +974,7 @@ def sft_finetune_on_knn(
     # Initialize Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_name_or_path,
-        use_fast=True,
-        trust_remote_code=True
+        use_fast=True, trust_remote_code=True, fix_mistral_regex=True
     )
     
     if tokenizer.pad_token is None:
@@ -1325,7 +1330,7 @@ def rl_finetune_on_knn(
     output_dir: str,
     train_dataset: Dataset,
     device: str,
-    rl_algo: str = "grpo", # Kept for arg compatibility, we default to GRPO
+    rl_algo: str = "grpo",
     use_lora: bool = True,
     lora_r: int = 128,
     lora_alpha: int = None,
@@ -1335,28 +1340,44 @@ def rl_finetune_on_knn(
     num_train_steps: int = 500,
     per_device_train_batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
-    num_generations: int = 4, # GRPO group size
+    num_generations: int = 4,
     learning_rate: float = 5e-6,
     bf16: bool = False,
     fp16: bool = True,
     seed: int = 42,
-    bert_reward_bs: int = 16, # Unused now, kept for signature compat
+    bert_reward_bs: int = 16, # Kept for signature compatibility
 ) -> str:
     print(f"\n[RL] Starting GRPO Fine-tuning on {len(train_dataset)} samples...")
     os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Load Model Explicitly with Flash Attention 2
+    # We must load the model ourselves to inject 'attn_implementation'
+    print(f"[RL] Loading model with Flash Attention 2 = {bf16}...")
     
-    # 1. Prepare Model & Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, trust_remote_code=True)
+    model_kwargs = {
+        "trust_remote_code": True,
+        "attn_implementation": "flash_attention_2" if bf16 else None
+    }
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_name_or_path,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float16,
+        **model_kwargs
+    )
+    
+    # 2. Prepare Tokenizer
+    # fix_mistral_regex is a tokenizer-specific argument, do not pass to model
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_name_or_path, 
+        use_fast=True, 
+        trust_remote_code=True, 
+        fix_mistral_regex=True
+    )
     if tokenizer.pad_token is None: 
         tokenizer.pad_token = tokenizer.eos_token
     
-    # 2. Format Dataset for GRPO
-    # GRPO expects a "prompt" column containing the raw string to feed the model.
-    # Our dataset currently has "prompt" as a List[Dict] (Chat format).
-    # We must apply the chat template NOW.
-    
+    # 3. Format Dataset
     def apply_chat_template(example):
-        # Render the list of messages into a single string
         rendered = tokenizer.apply_chat_template(
             example["prompt"], 
             tokenize=False, 
@@ -1367,11 +1388,10 @@ def rl_finetune_on_knn(
     print("[RL] Applying chat template to dataset...")
     formatted_dataset = train_dataset.map(apply_chat_template)
     
-    # 3. Define Reward Function
-    # We use the simplified BLEU reward
+    # 4. Define Reward Function (BLEU)
     reward_fn = make_bleu_reward_fn()
 
-    # 4. LoRA Configuration
+    # 5. LoRA Configuration
     peft_config = None
     if use_lora:
         if lora_alpha is None: lora_alpha = lora_r * 2
@@ -1380,23 +1400,26 @@ def rl_finetune_on_knn(
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             task_type="CAUSAL_LM",
-            target_modules="all-linear", # DeepSeek/Qwen usually benefit from all-linear
+            target_modules="all-linear",
             bias="none",
         )
 
-    # 5. Training Arguments
+    # 6. Training Arguments
+    # FIX: Removed 'attn_implementation' from here (it belongs in model loading)
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=learning_rate,
         max_steps=num_train_steps,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False}, 
         
         # GRPO Specifics
-        num_generations=num_generations, # Group size (e.g. 4 or 8)
+        num_generations=num_generations, 
         max_prompt_length=max_prompt_length,
         max_completion_length=max_completion_length,
-        beta=0.04, # KL penalty coefficient (default 0.04 is usually stable)
+        beta=0.04, 
         
         # Optimization
         bf16=bf16,
@@ -1404,24 +1427,25 @@ def rl_finetune_on_knn(
         logging_steps=10,
         save_steps=100,
         seed=seed,
-        report_to="none", # Change to "wandb" if needed
-        remove_unused_columns=False, # Vital: keeps 'reference' column for reward_fn
+        report_to="none", 
+        remove_unused_columns=False, 
     )
 
-    # 6. Initialize Trainer
+    # 7. Initialize Trainer with the LOADED MODEL
     trainer = GRPOTrainer(
-        model=base_model_name_or_path,
+        model=model, # Pass the object, not the string path
         reward_funcs=reward_fn,
         args=training_args,
         train_dataset=formatted_dataset,
         peft_config=peft_config,
+        # processing_class=tokenizer # Uncomment if using newer TRL versions
     )
 
-    # 7. Train
+    # 8. Train
     print("[RL] Training...")
     trainer.train()
     
-    # 8. Save
+    # 9. Save
     print(f"[RL] Saving model to {output_dir}")
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -1462,7 +1486,7 @@ def generate_desc(
     except NameError:
         model_max_length = 2048
 
-    tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     
     config = AutoConfig.from_pretrained(llm_dir_or_name)
@@ -1732,6 +1756,8 @@ def main():
 
     parser.add_argument("--rl_algo", default=None, choices=["grpo", "ppo"])
     parser.add_argument("--rl_steps", default=300, type=int)
+    # [UPDATED] Added bf16 argument for L4/A100 optimization
+    parser.add_argument("--bf16", action="store_true", help="Enable bfloat16 (Required for L4/A100)")
     parser.add_argument("--lr", default=0.5e-6, type=float)
     parser.add_argument("--per_device_bs", default=2, type=int)
     parser.add_argument("--grad_accum", default=4, type=int)
@@ -1749,7 +1775,7 @@ def main():
     VAL_GRAPHS = str(data_path / "validation_graphs.pkl")
     TEST_GRAPHS = str(data_path / "test_graphs.pkl")
     if args.gnn_path is not None:
-        MODEL_PATH = str(Path(args.gnn_path).resolve()) # str(base_path / "model_checkpoint.pt")
+        MODEL_PATH = str(Path(args.gnn_path).resolve()) 
     else:
         MODEL_PATH = str(base_path / "model_checkpoint.pt")
     if args.train_emb_path is not None:
@@ -1779,14 +1805,12 @@ def main():
     # 1. THRESHOLD STRATEGY
     # ---------------------------------------------------------
     # We need thresholds to be consistent between Train and Test.
-    global_thresholds = None
 
     # If we are training, we MUST compute them from training data
     if args.do_finetune:
         print("Computing global similarity thresholds from Training Data...")
         
         # We need the training GNN embeddings to compute thresholds
-        # (Re-using the logic from build_dataset briefly to get sims)
         train_id2emb = load_id2emb(TRAIN_EMB)
         train_ids = list(train_id2emb.keys())
         train_tgt_embs = torch.stack([train_id2emb[i] for i in train_ids]).to(device)
@@ -1797,8 +1821,6 @@ def main():
         train_gnn_embs, _ = encode_graphs(gnn, TRAIN_GRAPHS, device=device, batch_size=args.encode_batch_size)
         
         # Leave-one-out KNN
-        # (We only need the sims, not the indices, to determine distribution)
-        # Note: This is fast on GPU
         sims = train_gnn_embs @ train_tgt_embs.t()
         # Mask self
         n = len(train_ids)
@@ -1829,14 +1851,13 @@ def main():
             leave_one_out=True, desc_key="Train",
         )
         
-        # <--- NEW: Build Validation Dataset for Early Stopping --->
+        # Validation Dataset for Early Stopping
         knn_val_ds = None
         if args.do_sft and args.sft_early_stopping: 
             print("Building KNN dataset (VAL) for Early Stopping...")
-            # Note: We use VAL_GRAPHS as the "query", but still retrieve from TRAIN_EMB
             knn_val_ds = build_knn_prompt_dataset(
                 gnn_model=gnn, 
-                train_graphs=VAL_GRAPHS, # <--- Use Val graphs here
+                train_graphs=VAL_GRAPHS, 
                 train_emb=TRAIN_EMB, 
                 device=device, k=args.k, encode_batch_size=args.encode_batch_size, 
                 tokenizer_or_path=args.base_llm, thresholds=global_thresholds, 
@@ -1844,31 +1865,36 @@ def main():
                 leave_one_out=True, desc_key="Val",
             )
         
-        print("Optimizing memory for SFT...")
+        # ==============================================================================
+        # CRITICAL MEMORY OPTIMIZATION: Flush GPU before LLM loading
+        # ==============================================================================
+        print(f"Post-KNN GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        print("Optimizing memory for SFT/RL: Moving GNN to CPU and emptying cache...")
         
-        # 1. Move GNN to CPU
+        # 1. Move GNN to CPU (keep object for generation later, but off VRAM)
         gnn.cpu()
         
-        # 2. Clear Python variables holding GPU tensors
-        # (train_id2emb holds text embeddings on GPU, we don't need them for SFT)
-        if 'train_id2emb' in locals():
-            del train_id2emb 
+        # 2. Delete heavy intermediate tensors
+        if 'train_tgt_embs' in locals(): del train_tgt_embs
+        if 'train_gnn_embs' in locals(): del train_gnn_embs
+        if 'sims' in locals(): del sims
+        # Also clear the loaded text embeddings from GPU if they are hanging around
+        # (The dataset knn_ds is now pure text, so we don't need the tensor dict)
+        if 'train_id2emb' in locals(): del train_id2emb
             
-        # 3. Force PyTorch to release "Reserved" memory back to the OS
+        # 3. Force Garbage Collection and CUDA Flush
         import gc
         gc.collect()
         torch.cuda.empty_cache()
         
         print(f"GPU Memory Free: {torch.cuda.mem_get_info()[0] / 1e9:.2f} GB")
-        # =========================================================
-        # [END] MEMORY OPTIMIZATION BLOCK
+        # ==============================================================================
 
         llm_dir = args.base_llm
         if args.do_sft:
             sft_dir = str(base_path / (args.out_llm_dir + "_sft"))
             print(f"Running SFT -> {sft_dir}")
             
-            # Decide NEFTune alpha
             neft_alpha = 5.0 if args.sft_neftune else None
 
             llm_dir = sft_finetune_on_knn(
@@ -1885,7 +1911,7 @@ def main():
                 gradient_accumulation_steps=args.grad_accum, 
                 max_prompt_length=context_len, 
                 max_completion_length=args.max_new_tokens, 
-                bf16=False, 
+                bf16=False, # SFT usually fine on FP16, can change if needed
                 fp16=torch.cuda.is_available(),
                 use_early_stopping=args.sft_early_stopping,
                 neftune_noise_alpha=neft_alpha
@@ -1893,13 +1919,25 @@ def main():
 
         if args.rl_algo is not None:
             print("Running RL fine-tuning...")
-            llm_dir = rl_finetune_on_knn(base_model_name_or_path=llm_dir, output_dir=str((base_path / args.out_llm_dir)), 
-                                          train_dataset=knn_ds, device=device, rl_algo=args.rl_algo, use_lora=use_lora, 
-                                          num_train_steps=args.rl_steps, learning_rate=args.lr, 
-                                          per_device_train_batch_size=args.per_device_bs, 
-                                          gradient_accumulation_steps=args.grad_accum, max_prompt_length=context_len, 
-                                          num_generations=args.num_generations, bert_reward_batch_size=args.bert_reward_bs, 
-                                          bf16=False, fp16=torch.cuda.is_available())
+            # [UPDATED CALL] Correct arguments for the new function signature
+            llm_dir = rl_finetune_on_knn(
+                base_model_name_or_path=llm_dir, 
+                output_dir=str((base_path / args.out_llm_dir)), 
+                train_dataset=knn_ds, 
+                device=device, 
+                rl_algo=args.rl_algo, 
+                use_lora=use_lora, 
+                num_train_steps=args.rl_steps, 
+                learning_rate=args.lr, 
+                per_device_train_batch_size=args.per_device_bs, 
+                gradient_accumulation_steps=args.grad_accum, 
+                max_prompt_length=context_len, 
+                max_completion_length=args.max_new_tokens, # Pass this!
+                num_generations=args.num_generations, 
+                bf16=args.bf16, # Pass the argument
+                fp16=(not args.bf16 and torch.cuda.is_available()),
+                # removed bert_reward_batch_size
+            )
 
     if args.do_generate:
         if args.split in ("validation", "val"):
@@ -1915,7 +1953,7 @@ def main():
             candidate = base_path / llm_path
             if candidate.exists(): llm_path = str(candidate)
         
-        # [START] Bring GNN back to GPU
+        # [START] Bring GNN back to GPU for generation
         gnn.to(device) 
         # [END]
 
