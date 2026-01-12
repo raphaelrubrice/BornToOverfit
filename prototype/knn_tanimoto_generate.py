@@ -452,125 +452,173 @@ from collections import Counter
 # Advanced Reward Engineering: Dynamic + Constraint Based
 # --------------------------------------------------------------------------------------
 
-class ChemistryReward:
-    def __init__(self, device: str, bert_batch_size: int = 32):
-        self.bert_scorer = CachedBERTScorer(device=device, batch_size=bert_batch_size)
+# class ChemistryReward:
+#     def __init__(self, device: str, bert_batch_size: int = 32):
+#         self.bert_scorer = CachedBERTScorer(device=device, batch_size=bert_batch_size)
         
-        # --- NEGATIVE CONSTRAINTS (The "Safety Net") ---
-        # These catch what BLEU/BERT miss: factual contradictions with the Input Card.
-        self.halogens_re = re.compile(r"fluor|chlor|brom|iod", re.IGNORECASE)
-        self.phospho_re = re.compile(r"phosph", re.IGNORECASE)
-        self.sulfur_re = re.compile(r"sulf|thio", re.IGNORECASE)
-        self.aromatic_re = re.compile(r"benz|phenyl|cycl|pyrid|furan|pyrrol|imida|indol", re.IGNORECASE)
+#         # --- NEGATIVE CONSTRAINTS (The "Safety Net") ---
+#         # These catch what BLEU/BERT miss: factual contradictions with the Input Card.
+#         self.halogens_re = re.compile(r"fluor|chlor|brom|iod", re.IGNORECASE)
+#         self.phospho_re = re.compile(r"phosph", re.IGNORECASE)
+#         self.sulfur_re = re.compile(r"sulf|thio", re.IGNORECASE)
+#         self.aromatic_re = re.compile(r"benz|phenyl|cycl|pyrid|furan|pyrrol|imida|indol", re.IGNORECASE)
 
-    def check_card_constraints(self, pred: str, prompt: str) -> float:
-        """
-        Parses the MolCard from the prompt.
-        If the Card says "0 Halogens", and the model generates "Chlorine", 
-        we apply a MASSIVE penalty. BLEU/BERT cannot detect this.
-        """
-        penalty = 0.0
-        pred_lower = pred.lower()
+#     def check_card_constraints(self, pred: str, prompt: str) -> float:
+#         """
+#         Parses the MolCard from the prompt.
+#         If the Card says "0 Halogens", and the model generates "Chlorine", 
+#         we apply a MASSIVE penalty. BLEU/BERT cannot detect this.
+#         """
+#         penalty = 0.0
+#         pred_lower = pred.lower()
 
-        # Extract 'elements' and 'counts' from the prompt's MolCard
-        try:
-            query_part = prompt.split("[QUERY MOLECULE]")[-1]
-        except IndexError:
-            return 0.0 
+#         # Extract 'elements' and 'counts' from the prompt's MolCard
+#         try:
+#             query_part = prompt.split("[QUERY MOLECULE]")[-1]
+#         except IndexError:
+#             return 0.0 
 
-        # Regex helpers to find values in the MolCard string
-        def get_val(key):
-            m = re.search(rf"{key}:\s*(\d+)", query_part)
-            return int(m.group(1)) if m else None
+#         # Regex helpers to find values in the MolCard string
+#         def get_val(key):
+#             m = re.search(rf"{key}:\s*(\d+)", query_part)
+#             return int(m.group(1)) if m else None
 
-        # 1. No Halogens Allowed?
-        halogens = get_val("halogens_total")
-        if halogens == 0 and self.halogens_re.search(pred_lower):
-            penalty -= 1.5 # Heavy penalty
+#         # 1. No Halogens Allowed?
+#         halogens = get_val("halogens_total")
+#         if halogens == 0 and self.halogens_re.search(pred_lower):
+#             penalty -= 1.5 # Heavy penalty
 
-        # 2. No Phosphorus? (Check elements line)
-        if "P=" not in query_part and self.phospho_re.search(pred_lower):
-            penalty -= 1.5
+#         # 2. No Phosphorus? (Check elements line)
+#         if "P=" not in query_part and self.phospho_re.search(pred_lower):
+#             penalty -= 1.5
 
-        # 3. No Sulfur?
-        if "S=" not in query_part and self.sulfur_re.search(pred_lower):
-            penalty -= 1.5
+#         # 3. No Sulfur?
+#         if "S=" not in query_part and self.sulfur_re.search(pred_lower):
+#             penalty -= 1.5
 
-        # 4. No Aromatics?
-        aromatic = get_val("aromatic_atoms")
-        if aromatic == 0 and self.aromatic_re.search(pred_lower):
-            penalty -= 1.0
+#         # 4. No Aromatics?
+#         aromatic = get_val("aromatic_atoms")
+#         if aromatic == 0 and self.aromatic_re.search(pred_lower):
+#             penalty -= 1.0
 
-        return penalty
+#         return penalty
 
-    def compute_length_penalty(self, pred: str, ref: str) -> float:
-        # Simple Gaussian window to prevent "short-caption" gaming
-        l_pred = len(pred.split())
-        l_ref = len(ref.split())
-        if l_ref == 0: return 0.0
+#     def compute_length_penalty(self, pred: str, ref: str) -> float:
+#         # Simple Gaussian window to prevent "short-caption" gaming
+#         l_pred = len(pred.split())
+#         l_ref = len(ref.split())
+#         if l_ref == 0: return 0.0
         
-        ratio = l_pred / l_ref
-        dev = abs(ratio - 1.0)
+#         ratio = l_pred / l_ref
+#         dev = abs(ratio - 1.0)
         
-        # If length is within +/- 20% of reference, give bonus
-        if dev <= 0.2: return 0.5
-        # Else decay linearly
-        return max(-1.0, 0.5 - (dev * 2.0))
+#         # If length is within +/- 20% of reference, give bonus
+#         if dev <= 0.2: return 0.5
+#         # Else decay linearly
+#         return max(-1.0, 0.5 - (dev * 2.0))
 
-    def get_rewards(self, prompts, completions, references):
-        # 1. Handle Completions (GRPO usually sends strings, PPO sends dicts)
-        preds = []
-        for c in completions:
-            if isinstance(c, str):
-                preds.append(c)
-            elif isinstance(c, list): 
-                # Handle [{"content": "..."}] format
-                preds.append(c[0]["content"])
-            else:
-                preds.append(str(c))
+#     def get_rewards(self, prompts, completions, references):
+#         # 1. Handle Completions (GRPO usually sends strings, PPO sends dicts)
+#         preds = []
+#         for c in completions:
+#             if isinstance(c, str):
+#                 preds.append(c)
+#             elif isinstance(c, list): 
+#                 # Handle [{"content": "..."}] format
+#                 preds.append(c[0]["content"])
+#             else:
+#                 preds.append(str(c))
                 
-        refs = list(references)
+#         refs = list(references)
         
-        # --- FIX START: Unpack Prompts from Chat Format ---
-        prompt_texts = []
-        for p in prompts:
-            if isinstance(p, list):
-                # Input is [{"role": "user", "content": "..."}]
-                # We need the plain string 'content' to parse the MolCard
-                parts = [m.get("content", "") for m in p]
-                prompt_texts.append("\n".join(parts))
-            else:
-                # Input is already a string
-                prompt_texts.append(str(p))
-        # --- FIX END ---
+#         # --- FIX START: Unpack Prompts from Chat Format ---
+#         prompt_texts = []
+#         for p in prompts:
+#             if isinstance(p, list):
+#                 # Input is [{"role": "user", "content": "..."}]
+#                 # We need the plain string 'content' to parse the MolCard
+#                 parts = [m.get("content", "") for m in p]
+#                 prompt_texts.append("\n".join(parts))
+#             else:
+#                 # Input is already a string
+#                 prompt_texts.append(str(p))
+#         # --- FIX END ---
         
-        # 2. Semantic Foundation (BLEU + BERT)
-        bert_scores = self.bert_scorer.score_f1(preds, refs)
+#         # 2. Semantic Foundation (BLEU + BERT)
+#         bert_scores = self.bert_scorer.score_f1(preds, refs)
         
-        rewards = []
-        # Zip over the extracted 'prompt_texts', not the raw 'prompts'
-        for prompt_text, pred, ref, bert in zip(prompt_texts, preds, refs, bert_scores):
-            bleu = bleu_f1_sentence(pred, ref)
+#         rewards = []
+#         # Zip over the extracted 'prompt_texts', not the raw 'prompts'
+#         for prompt_text, pred, ref, bert in zip(prompt_texts, preds, refs, bert_scores):
+#             bleu = bleu_f1_sentence(pred, ref)
             
-            # Weighted Composite
-            total = (
-                0.5 * bert + 
-                0.4 * bleu + 
-                1.0 * self.check_card_constraints(pred, prompt_text) + 
-                0.2 * self.compute_length_penalty(pred, ref)
-            )
-            rewards.append(max(-3.0, min(3.0, float(total))))
+#             # Weighted Composite
+#             total = (
+#                 0.5 * bert + 
+#                 0.4 * bleu + 
+#                 1.0 * self.check_card_constraints(pred, prompt_text) + 
+#                 0.2 * self.compute_length_penalty(pred, ref)
+#             )
+#             rewards.append(max(-3.0, min(3.0, float(total))))
+            
+#         return rewards
+
+# def make_reward_fn(device: str, bert_batch_size: int = 32):
+#     engine = ChemistryReward(device=device, bert_batch_size=bert_batch_size)
+
+#     # Note: Signature accepts 'prompts' now
+#     def reward_fn(prompts, completions, reference, **kwargs):
+#         return engine.get_rewards(prompts, completions, reference)
+
+#     return reward_fn
+
+class BLEUReward:
+    def __init__(self):
+        # We use sacrebleu for standard BLEU computation
+        import sacrebleu
+        self.metric = sacrebleu
+
+    def __call__(self, prompts, completions, **kwargs):
+        """
+        GRPO calls this with:
+          prompts: list[str] (The context fed to the model)
+          completions: list[str] (The generated text)
+          **kwargs: Contains 'reference' from the dataset if available
+        """
+        # 1. Extract References from the dataset (passed via kwargs)
+        # GRPOTrainer passes the batch columns in kwargs.
+        # We expect a list of reference strings.
+        references = kwargs.get("reference", None)
+        
+        if references is None:
+            # Fallback: If 'reference' isn't passed, check if it's inside 'prompts' logic 
+            # (unlikely in standard TRL usage, so we return 0.0 to avoid crash)
+            return [0.0] * len(completions)
+
+        rewards = []
+        for pred, ref in zip(completions, references):
+            # 2. Compute Sentence BLEU
+            # We assume 'ref' is a string. Sacrebleu expects a list of references.
+            if not pred.strip():
+                rewards.append(-1.0) # Penalize empty
+                continue
+                
+            # Score is 0-100
+            score = self.metric.sentence_bleu(pred.lower(), [ref.lower()]).score
+            
+            # 3. Scale to 0-1 range for RL stability
+            # We add a tiny length penalty to prevent 'short gaming' if BLEU matches just 1 word
+            len_ratio = len(pred) / max(1, len(ref))
+            len_penalty = 1.0
+            if len_ratio < 0.3: len_penalty = 0.5
+            
+            rewards.append((score / 100.0) * len_penalty)
             
         return rewards
 
-def make_reward_fn(device: str, bert_batch_size: int = 32):
-    engine = ChemistryReward(device=device, bert_batch_size=bert_batch_size)
-
-    # Note: Signature accepts 'prompts' now
-    def reward_fn(prompts, completions, reference, **kwargs):
-        return engine.get_rewards(prompts, completions, reference)
-
-    return reward_fn
+def make_bleu_reward_fn():
+    engine = BLEUReward()
+    return engine
 
 # --------------------------------------------------------------------------------------
 # Helpers for Tanimoto
@@ -1153,15 +1201,131 @@ def sft_finetune_on_knn(
     
     return output_dir
 
+# # --------------------------------------------------------------------------------------
+# # RL fine-tuning
+# # --------------------------------------------------------------------------------------
+# def rl_finetune_on_knn(
+#     base_model_name_or_path: str,
+#     output_dir: str,
+#     train_dataset: Dataset,
+#     device: str,
+#     rl_algo: str = "ppo",
+#     use_lora: bool = True,
+#     lora_r: int = 128,
+#     lora_alpha: int = None,
+#     lora_dropout: float = 0.05,
+#     max_prompt_length: int = 1024,
+#     max_completion_length: int = 192,
+#     num_train_steps: int = 500,
+#     per_device_train_batch_size: int = 2,
+#     gradient_accumulation_steps: int = 4,
+#     num_generations: int = 4,
+#     learning_rate: float = 5e-6,
+#     bf16: bool = False,
+#     fp16: bool = True,
+#     seed: int = 42,
+#     bert_reward_batch_size: int = 16,
+# ) -> str:
+#     os.makedirs(output_dir, exist_ok=True)
+#     rl_algo = (rl_algo or "grpo").strip().lower()
+#     tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True)
+#     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+#     tokenizer.padding_side = "left"
+#     config = AutoConfig.from_pretrained(base_model_name_or_path)
+
+#     if bf16: 
+#         dtype = torch.bfloat16
+#     elif fp16: 
+#         dtype = torch.float16 if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.bfloat16
+#     else: 
+#         dtype = torch.float32
+    
+#     # Using Lora alpha = 2 * lora_r
+#     if lora_alpha is None:
+#         lora_alpha = 2 * lora_r
+
+#     if rl_algo == "ppo":
+#         model_cls = AutoModelForSeq2SeqLMWithValueHead if config.is_encoder_decoder else AutoModelForCausalLMWithValueHead
+#         base_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
+#         base = base_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
+#         ref_base = base_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
+#         if use_lora:
+#             lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
+#             base = get_peft_model(base, lora_cfg)
+#         model = model_cls(base)
+#         ref_model = model_cls(ref_base)
+#     else:
+#         model_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
+#         model = model_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
+#         if use_lora:
+#             lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
+#             model = get_peft_model(model, lora_cfg)
+
+#     reward_fn = make_reward_fn(device=device, bert_batch_size=bert_reward_batch_size)
+
+#     if rl_algo == "grpo":
+#         training_args = GRPOConfig(output_dir=output_dir, learning_rate=learning_rate, max_steps=num_train_steps, 
+#                         per_device_train_batch_size=per_device_train_batch_size, gradient_accumulation_steps=gradient_accumulation_steps, 
+#                         num_generations=num_generations, max_prompt_length=max_prompt_length, max_completion_length=max_completion_length, 
+#                         bf16=bf16, fp16=fp16 if not bf16 else False, logging_steps=10, save_steps=100, seed=seed, report_to=[])
+#         trainer = GRPOTrainer(model=model, args=training_args, train_dataset=train_dataset, reward_funcs=reward_fn)
+#         trainer.train()
+#         trainer.save_model(output_dir)
+#         tokenizer.save_pretrained(output_dir)
+#         return output_dir
+    
+#     # PPO Path
+#     def _prompt_to_text(p):
+#         if isinstance(p, str): return p
+#         if isinstance(p, list):
+#             parts = []
+#             for m in p:
+#                 role = (m.get("role", "user") or "user").upper()
+#                 parts.append(f"{role}: {m.get('content','')}")
+#             parts.append("ASSISTANT:")
+#             return "\n".join(parts)
+#         return str(p)
+
+#     train_dataset = train_dataset.map(lambda ex: {"prompt": _prompt_to_text(ex["prompt"])})
+#     ppo_cfg = PPOConfig(batch_size=per_device_train_batch_size, mini_batch_size=max(1, per_device_train_batch_size // max(1, gradient_accumulation_steps)), gradient_accumulation_steps=gradient_accumulation_steps, learning_rate=learning_rate, seed=seed)
+
+#     def _collate(batch):
+#         prompts = [b["prompt"] for b in batch]
+#         refs = [b["reference"] for b in batch]
+#         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_length)
+#         enc["reference_text"] = refs 
+#         return enc
+
+#     trainer = PPOTrainer(config=ppo_cfg, model=model, ref_model=ref_model, tokenizer=tokenizer, dataset=train_dataset, data_collator=_collate)
+#     gen_kwargs = dict(max_new_tokens=max_completion_length, do_sample=True, top_p=0.9, temperature=0.8, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+
+#     step = 0
+#     for batch in trainer.dataloader:
+#         if step >= num_train_steps: break
+#         query_tensors = batch["input_ids"].to(trainer.accelerator.device)
+#         attention_mask = batch.get("attention_mask", None)
+#         if attention_mask is not None: attention_mask = attention_mask.to(trainer.accelerator.device)
+#         response_tensors = trainer.generate(query_tensors, attention_mask=attention_mask, **gen_kwargs)
+#         responses_dec = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+#         completions = [[{"role": "assistant", "content": r}] for r in responses_dec]
+#         reward_vals = reward_fn(completions=completions, reference=batch["reference_text"])
+#         rewards = [torch.tensor(r, device=trainer.accelerator.device) for r in reward_vals]
+#         trainer.step(query_tensors, response_tensors, rewards)
+#         step += 1
+
+#     trainer.save_pretrained(output_dir)
+#     tokenizer.save_pretrained(output_dir)
+#     return output_dir
+
 # --------------------------------------------------------------------------------------
-# RL fine-tuning
+# RL fine-tuning (GRPO)
 # --------------------------------------------------------------------------------------
 def rl_finetune_on_knn(
     base_model_name_or_path: str,
     output_dir: str,
     train_dataset: Dataset,
     device: str,
-    rl_algo: str = "ppo",
+    rl_algo: str = "grpo", # Kept for arg compatibility, we default to GRPO
     use_lora: bool = True,
     lora_r: int = 128,
     lora_alpha: int = None,
@@ -1171,102 +1335,97 @@ def rl_finetune_on_knn(
     num_train_steps: int = 500,
     per_device_train_batch_size: int = 2,
     gradient_accumulation_steps: int = 4,
-    num_generations: int = 4,
+    num_generations: int = 4, # GRPO group size
     learning_rate: float = 5e-6,
     bf16: bool = False,
     fp16: bool = True,
     seed: int = 42,
-    bert_reward_batch_size: int = 16,
+    bert_reward_bs: int = 16, # Unused now, kept for signature compat
 ) -> str:
+    print(f"\n[RL] Starting GRPO Fine-tuning on {len(train_dataset)} samples...")
     os.makedirs(output_dir, exist_ok=True)
-    rl_algo = (rl_algo or "grpo").strip().lower()
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, use_fast=True, trust_remote_code=True)
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    config = AutoConfig.from_pretrained(base_model_name_or_path)
-
-    if bf16: 
-        dtype = torch.bfloat16
-    elif fp16: 
-        dtype = torch.float16 if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.bfloat16
-    else: 
-        dtype = torch.float32
     
-    # Using Lora alpha = 2 * lora_r
-    if lora_alpha is None:
-        lora_alpha = 2 * lora_r
-
-    if rl_algo == "ppo":
-        model_cls = AutoModelForSeq2SeqLMWithValueHead if config.is_encoder_decoder else AutoModelForCausalLMWithValueHead
-        base_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
-        base = base_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
-        ref_base = base_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
-        if use_lora:
-            lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
-            base = get_peft_model(base, lora_cfg)
-        model = model_cls(base)
-        ref_model = model_cls(ref_base)
-    else:
-        model_cls = AutoModelForSeq2SeqLM if config.is_encoder_decoder else AutoModelForCausalLM
-        model = model_cls.from_pretrained(base_model_name_or_path, dtype=dtype, device_map="auto")
-        if use_lora:
-            lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="SEQ_2_SEQ_LM" if config.is_encoder_decoder else "CAUSAL_LM", target_modules="all-linear")
-            model = get_peft_model(model, lora_cfg)
-
-    reward_fn = make_reward_fn(device=device, bert_batch_size=bert_reward_batch_size)
-
-    if rl_algo == "grpo":
-        training_args = GRPOConfig(output_dir=output_dir, learning_rate=learning_rate, max_steps=num_train_steps, 
-                        per_device_train_batch_size=per_device_train_batch_size, gradient_accumulation_steps=gradient_accumulation_steps, 
-                        num_generations=num_generations, max_prompt_length=max_prompt_length, max_completion_length=max_completion_length, 
-                        bf16=bf16, fp16=fp16 if not bf16 else False, logging_steps=10, save_steps=100, seed=seed, report_to=[])
-        trainer = GRPOTrainer(model=model, args=training_args, train_dataset=train_dataset, reward_funcs=reward_fn)
-        trainer.train()
-        trainer.save_model(output_dir)
-        tokenizer.save_pretrained(output_dir)
-        return output_dir
+    # 1. Prepare Model & Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path, trust_remote_code=True)
+    if tokenizer.pad_token is None: 
+        tokenizer.pad_token = tokenizer.eos_token
     
-    # PPO Path
-    def _prompt_to_text(p):
-        if isinstance(p, str): return p
-        if isinstance(p, list):
-            parts = []
-            for m in p:
-                role = (m.get("role", "user") or "user").upper()
-                parts.append(f"{role}: {m.get('content','')}")
-            parts.append("ASSISTANT:")
-            return "\n".join(parts)
-        return str(p)
+    # 2. Format Dataset for GRPO
+    # GRPO expects a "prompt" column containing the raw string to feed the model.
+    # Our dataset currently has "prompt" as a List[Dict] (Chat format).
+    # We must apply the chat template NOW.
+    
+    def apply_chat_template(example):
+        # Render the list of messages into a single string
+        rendered = tokenizer.apply_chat_template(
+            example["prompt"], 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        return {"prompt": rendered, "reference": example["reference"]}
 
-    train_dataset = train_dataset.map(lambda ex: {"prompt": _prompt_to_text(ex["prompt"])})
-    ppo_cfg = PPOConfig(batch_size=per_device_train_batch_size, mini_batch_size=max(1, per_device_train_batch_size // max(1, gradient_accumulation_steps)), gradient_accumulation_steps=gradient_accumulation_steps, learning_rate=learning_rate, seed=seed)
+    print("[RL] Applying chat template to dataset...")
+    formatted_dataset = train_dataset.map(apply_chat_template)
+    
+    # 3. Define Reward Function
+    # We use the simplified BLEU reward
+    reward_fn = make_bleu_reward_fn()
 
-    def _collate(batch):
-        prompts = [b["prompt"] for b in batch]
-        refs = [b["reference"] for b in batch]
-        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_length)
-        enc["reference_text"] = refs 
-        return enc
+    # 4. LoRA Configuration
+    peft_config = None
+    if use_lora:
+        if lora_alpha is None: lora_alpha = lora_r * 2
+        peft_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            task_type="CAUSAL_LM",
+            target_modules="all-linear", # DeepSeek/Qwen usually benefit from all-linear
+            bias="none",
+        )
 
-    trainer = PPOTrainer(config=ppo_cfg, model=model, ref_model=ref_model, tokenizer=tokenizer, dataset=train_dataset, data_collator=_collate)
-    gen_kwargs = dict(max_new_tokens=max_completion_length, do_sample=True, top_p=0.9, temperature=0.8, pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
+    # 5. Training Arguments
+    training_args = GRPOConfig(
+        output_dir=output_dir,
+        learning_rate=learning_rate,
+        max_steps=num_train_steps,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        
+        # GRPO Specifics
+        num_generations=num_generations, # Group size (e.g. 4 or 8)
+        max_prompt_length=max_prompt_length,
+        max_completion_length=max_completion_length,
+        beta=0.04, # KL penalty coefficient (default 0.04 is usually stable)
+        
+        # Optimization
+        bf16=bf16,
+        fp16=(fp16 and not bf16),
+        logging_steps=10,
+        save_steps=100,
+        seed=seed,
+        report_to="none", # Change to "wandb" if needed
+        remove_unused_columns=False, # Vital: keeps 'reference' column for reward_fn
+    )
 
-    step = 0
-    for batch in trainer.dataloader:
-        if step >= num_train_steps: break
-        query_tensors = batch["input_ids"].to(trainer.accelerator.device)
-        attention_mask = batch.get("attention_mask", None)
-        if attention_mask is not None: attention_mask = attention_mask.to(trainer.accelerator.device)
-        response_tensors = trainer.generate(query_tensors, attention_mask=attention_mask, **gen_kwargs)
-        responses_dec = tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
-        completions = [[{"role": "assistant", "content": r}] for r in responses_dec]
-        reward_vals = reward_fn(completions=completions, reference=batch["reference_text"])
-        rewards = [torch.tensor(r, device=trainer.accelerator.device) for r in reward_vals]
-        trainer.step(query_tensors, response_tensors, rewards)
-        step += 1
+    # 6. Initialize Trainer
+    trainer = GRPOTrainer(
+        model=base_model_name_or_path,
+        reward_funcs=reward_fn,
+        args=training_args,
+        train_dataset=formatted_dataset,
+        peft_config=peft_config,
+    )
 
-    trainer.save_pretrained(output_dir)
+    # 7. Train
+    print("[RL] Training...")
+    trainer.train()
+    
+    # 8. Save
+    print(f"[RL] Saving model to {output_dir}")
+    trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
+    
     return output_dir
 
 # --------------------------------------------------------------------------------------
