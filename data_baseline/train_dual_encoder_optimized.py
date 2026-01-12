@@ -60,7 +60,7 @@ class BondEncoder(nn.Module):
         return sum(emb(edge_attr[:, i]) for i, emb in enumerate(self.embeddings))
 
 class MolGNN(nn.Module):
-    def __init__(self, hidden_dim=256, out_dim=768, num_layers=4, num_heads=8, dropout=0.1):
+    def __init__(self, hidden_dim=256, out_dim=768, num_layers=4, num_heads=4, dropout=0.1):
         super().__init__()
         self.atom_encoder = AtomEncoder(hidden_dim)
         self.bond_encoder = BondEncoder(hidden_dim)
@@ -290,7 +290,7 @@ def main():
         'hidden_dim': 256,
         'out_dim': 768,
         'num_layers': 4,
-        'num_heads': 8,
+        'num_heads': 4,
         'dropout': 0.1
     }
     model = DualEncoder(args.model_name, gnn_config, freeze_layers=args.freeze_layers).to(DEVICE)
