@@ -1697,28 +1697,82 @@ def generate_desc(
     
     print(f"Loading LLM and Tokenizer from {llm_dir_or_name}...")
     
-    try:
-        model_max_length = get_safe_context_length(llm_dir_or_name, cap=max_length)
-    except NameError:
-        model_max_length = 2048
+    # --- [NEW] Robust Loading for LoRA vs Full Model ---
+    from peft import PeftModel, PeftConfig
+    import os
 
-    tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    # Check if this is a LoRA adapter (has adapter_config.json but no config.json)
+    is_adapter = os.path.exists(os.path.join(llm_dir_or_name, "adapter_config.json"))
     
-    config = AutoConfig.from_pretrained(llm_dir_or_name)
-    is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
-    tokenizer.padding_side = "right" if is_seq2seq else "left"
-
+    # Determine basic properties
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16
         bf16 = True
     elif torch.cuda.is_available():
         dtype = torch.float16
+        bf16 = False
     else:
         dtype = torch.float32
+        bf16 = False
 
-    model_cls = AutoModelForSeq2SeqLM if is_seq2seq else AutoModelForCausalLM
-    llm = model_cls.from_pretrained(llm_dir_or_name, dtype=dtype, device_map="auto", attn_implementation="flash_attention_2" if bf16 else None)
+    try:
+        model_max_length = get_safe_context_length(llm_dir_or_name, cap=max_length)
+    except:
+        model_max_length = 2048
+
+    if is_adapter:
+        print(f"  -> Detected LoRA Adapter. Loading Base Model first...")
+        
+        # 1. Read the adapter config to find the base model path
+        peft_config = PeftConfig.from_pretrained(llm_dir_or_name)
+        base_model_path = peft_config.base_model_name_or_path
+        print(f"  -> Base Model Path: {base_model_path}")
+        
+        # 2. Load the Base Model (SFT)
+        # Assuming CausalLM for LoRA usually
+        config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
+        llm = AutoModelForCausalLM.from_pretrained(
+            base_model_path,
+            config=config,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            device_map="auto",
+            attn_implementation="flash_attention_2" if bf16 else None
+        )
+        
+        # 3. Load and Attach the DPO Adapter
+        print(f"  -> Merging DPO Adapter...")
+        llm = PeftModel.from_pretrained(llm, llm_dir_or_name)
+        
+        # 4. Load Tokenizer (Try adapter first, then base)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
+        except:
+            print("  -> Loading tokenizer from base model...")
+            tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
+            
+        is_seq2seq = False # LoRA usually on Decoder-only here
+
+    else:
+        # --- Standard Loading (Full Model) ---
+        print(f"  -> Loading as Full Model...")
+        config = AutoConfig.from_pretrained(llm_dir_or_name, trust_remote_code=True)
+        is_seq2seq = bool(getattr(config, "is_encoder_decoder", False))
+        
+        tokenizer = AutoTokenizer.from_pretrained(llm_dir_or_name, use_fast=True, trust_remote_code=True, fix_mistral_regex=True)
+        
+        model_cls = AutoModelForSeq2SeqLM if is_seq2seq else AutoModelForCausalLM
+        llm = model_cls.from_pretrained(
+            llm_dir_or_name, 
+            dtype=dtype, 
+            device_map="auto", 
+            attn_implementation="flash_attention_2" if bf16 else None
+        )
+
+    # Final Tokenizer Setup
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right" if is_seq2seq else "left"
+    
     llm.eval()
     
     if hasattr(torch, "compile") and os.name != "nt":
@@ -1861,7 +1915,8 @@ def generate_desc(
         top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        decoder_start_token_id=llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id
+        decoder_start_token_id=llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id,
+        repetition_penalty=1.2 # [ADDED] Robust Repetition Penalty
     )
 
     generations = []
@@ -1947,6 +2002,7 @@ def main():
     parser.add_argument("-f_data", default="data_baseline/data", type=str)
     parser.add_argument("-f", default="data_baseline/data", type=str)
     parser.add_argument("-gnn_path", default=None)
+    parser.add_argument("-train_graph_path", default=None)
     parser.add_argument("-train_emb_path", default=None)
 
     parser.add_argument("--k", default=3, type=int)
@@ -1988,7 +2044,7 @@ def main():
     parent_folder = file_path.parent
     data_path = parent_folder.parent / args.f_data
     base_path = parent_folder.parent / args.f
-    TRAIN_GRAPHS = str(data_path / "train_graphs.pkl")
+    TRAIN_GRAPHS = args.train_graph_path if args.train_graph_path is not None else str(data_path / "train_graphs.pkl")
     VAL_GRAPHS = str(data_path / "validation_graphs.pkl")
     TEST_GRAPHS = str(data_path / "test_graphs.pkl")
     if args.gnn_path is not None:

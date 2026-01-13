@@ -319,7 +319,17 @@ def load_molgnn_gps_pooling_from_checkpoint(
         raise ValueError(f"Unsupported GNN class: {model_class}")
     print("Instantiating..")
     # FIX: Provide defaults for missing constants
-    gnn = MolGNN_GPS_pooling(
+    try:
+        gnn = MolGNN_GPS_pooling(
+            hidden_dim=cfg.get("hidden_dim", 256), 
+            out_dim=cfg.get("out_dim", 768), 
+            num_layers=cfg.get("num_layers", 4),
+            num_heads=cfg.get("num_heads", 8),
+            dropout=cfg.get("dropout", 0.1),
+            pooling=cfg.get("pooling", "sum")
+        ).to(device)
+    except:
+        gnn = MolGNN_GPS_pooling(
         hidden_dim=cfg.get("hidden_dim", 256), 
         out_dim=cfg.get("out_dim", 768), 
         num_layers=cfg.get("num_layers", 4),
