@@ -1907,16 +1907,27 @@ def generate_desc(
 
     print(f"Generating with Batch Size {gen_batch_size}...")
     
+    # gen_cfg = GenerationConfig(
+    #     max_new_tokens=max_new_tokens,
+    #     do_sample=do_sample,       
+    #     num_beams=1,
+    #     temperature=temperature,
+    #     top_p=top_p,
+    #     pad_token_id=tokenizer.pad_token_id,
+    #     eos_token_id=tokenizer.eos_token_id,
+    #     decoder_start_token_id=llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id,
+    # )
+
+    # Deterministic was better for BLEU
     gen_cfg = GenerationConfig(
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,       
-        num_beams=1,
-        temperature=temperature,
-        top_p=top_p,
+        do_sample=False,
+        num_beams=5,
+        temperature=1.0, 
+        top_p=1.0,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         decoder_start_token_id=llm.config.decoder_start_token_id if hasattr(llm.config, "decoder_start_token_id") else tokenizer.pad_token_id,
-        repetition_penalty=1.2 # [ADDED] Robust Repetition Penalty
     )
 
     generations = []
@@ -1978,13 +1989,13 @@ def generate_desc(
     df.to_csv(out_csv, index=False)
     
     eval_df = df[["ID", "generated_description"]].rename(columns={"generated_description": "description"})
-    submit_out_csv = out_csv.replace(".csv", "_submit.csv")
+    submit_out_csv = out_csv.replace(".csv", "SAMPLE_submit.csv")
     eval_df.to_csv(submit_out_csv, index=False)
     
     if evaluate and _EVAL_AVAILABLE:
         print("Evaluating...")
         query_id2desc = load_descriptions_from_graphs(query_graphs)
-        metrics_path = str(Path(out_csv).with_suffix(".metrics.json"))
+        metrics_path = str(Path(out_csv).with_suffix(".SAMPLE_metrics.json"))
         evaluate_retrieval_text_metrics(
             results_df=eval_df, 
             test_id2desc=query_id2desc, 
