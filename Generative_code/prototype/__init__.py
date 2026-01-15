@@ -1,0 +1,1 @@
+"""Module to define alternative solutions to prototype for the challenge"""
