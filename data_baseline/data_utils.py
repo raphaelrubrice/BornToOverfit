@@ -15,7 +15,7 @@ from rdkit import Chem, rdBase
 from rdkit.Chem import rdchem
 from tqdm.auto import tqdm
 
-# This prevents the red "Can't kekulize" spam in your console
+# This prevents the red "Can't kekulize" spam 
 rdBase.DisableLog('rdApp.*') 
 
 # =========================================================
@@ -254,13 +254,6 @@ def pyg_to_smiles(data, x_map, e_map) -> str:
     except Exception:
         return "INVALID_SMILES"
 
-# def _safe_map_lookup(mapping, idx, default):
-#     # Reverse lookup helper: assumes mapping is {value: index}
-#     # You likely need to invert your dictionaries once: {index: value}
-#     for k, v in mapping.items():
-#         if v == idx:
-#             return k
-#     return default
 
 # Format: { AtomicNumber: (StandardMass, AbundanceOfMajorIsotope, SpinOfMajorIsotope) }
 # Data sources: IUPAC Standard Atomic Weights & NNDC NuDat (for spins/abundance).

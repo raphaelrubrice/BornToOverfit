@@ -92,7 +92,7 @@ def compute_bertscore_roberta_base(
         cands=preds,
         refs=refs,
         model_type="roberta-base",
-        lang="en",              # if your text is not English, you can remove this and rely on model_type only
+        lang="en",
         device=device,
         batch_size=batch_size,
         idf=idf,

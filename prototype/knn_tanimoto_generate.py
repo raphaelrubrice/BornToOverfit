@@ -196,14 +196,6 @@ def encode_graphs(model: nn.Module, graph_pkl: str, device: str, batch_size: int
     embs = torch.cat(all_embs, dim=0)
     return embs, all_ids
 
-# def knn_topk(query_embs_norm, train_embs_norm, k, mask_self=None):
-#     sims = query_embs_norm @ train_embs_norm.t()
-#     if mask_self is not None:
-#         sims = sims.masked_fill(mask_self, float("-inf"))
-#     k_eff = min(k, sims.size(1))
-#     top_sims, top_idx = torch.topk(sims, k=k_eff, dim=-1, largest=True, sorted=True)
-#     return top_idx, top_sims
-
 def knn_topk(
     query_embs_norm: torch.Tensor,
     train_embs_norm: torch.Tensor,
@@ -2040,7 +2032,6 @@ def main():
 
     parser.add_argument("--rl_algo", default=None, choices=["grpo", "ppo"])
     parser.add_argument("--rl_steps", default=300, type=int)
-    # [UPDATED] Added bf16 argument for L4/A100 optimization
     parser.add_argument("--bf16", action="store_true", help="Enable bfloat16 (Required for L4/A100)")
     parser.add_argument("--lr", default=2e-6, type=float)
     parser.add_argument("--per_device_bs", default=2, type=int)
@@ -2195,33 +2186,13 @@ def main():
                 gradient_accumulation_steps=args.grad_accum, 
                 max_prompt_length=context_len, 
                 max_completion_length=args.max_new_tokens, 
-                bf16=False, # SFT usually fine on FP16, can change if needed
+                bf16=False,
                 fp16=torch.cuda.is_available(),
                 use_early_stopping=args.sft_early_stopping,
                 neftune_noise_alpha=neft_alpha
             )
 
-        # if args.rl_algo is not None:
-        #     print("Running RL fine-tuning...")
-        #     # [UPDATED CALL] Correct arguments for the new function signature
-        #     llm_dir = rl_finetune_on_knn(
-        #         base_model_name_or_path=llm_dir, 
-        #         output_dir=str((base_path / args.out_llm_dir)), 
-        #         train_dataset=knn_ds, 
-        #         device=device, 
-        #         rl_algo=args.rl_algo, 
-        #         use_lora=use_lora, 
-        #         num_train_steps=args.rl_steps, 
-        #         learning_rate=args.lr, 
-        #         per_device_train_batch_size=args.per_device_bs, 
-        #         gradient_accumulation_steps=args.grad_accum, 
-        #         max_prompt_length=context_len, 
-        #         max_completion_length=args.max_new_tokens, # Pass this!
-        #         num_generations=args.num_generations, 
-        #         bf16=args.bf16, # Pass the argument
-        #         fp16=(not args.bf16 and torch.cuda.is_available()),
-        #         # removed bert_reward_batch_size
-        #     )
+        
         if args.rl_algo is not None:
             # We are hijacking the 'rl_algo' flag to run DPO now
             print("Switching to Hybrid DPO strategy...")
@@ -2245,7 +2216,7 @@ def main():
                 use_lora=use_lora,
                 bf16=args.bf16,
                 fp16=(not args.bf16 and torch.cuda.is_available()),
-                gen_subset_size=2000 # Configurable
+                gen_subset_size=2000
             )
 
     if args.do_generate:
@@ -2262,9 +2233,8 @@ def main():
             candidate = base_path / llm_path
             if candidate.exists(): llm_path = str(candidate)
         
-        # [START] Bring GNN back to GPU for generation
+        # Bring GNN back to GPU for generation
         gnn.to(device) 
-        # [END]
 
         print(f"Generating with model: {llm_path}")
         generate_desc(gnn_model=gnn, llm_dir_or_name=llm_path, train_graphs=TRAIN_GRAPHS, 

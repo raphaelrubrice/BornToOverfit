@@ -1124,7 +1124,7 @@ def generate_desc(
     # ----------------------------
     print(f"Loading LLM and Tokenizer from {llm_dir_or_name}...")
     
-    # Auto-detect context length (reusing helper from your script)
+    # Auto-detect context length
     try:
         model_max_length = get_safe_context_length(llm_dir_or_name, cap=max_length)
     except NameError:
@@ -1164,7 +1164,6 @@ def generate_desc(
     # ----------------------------
     # 2. Retrieval Phase (Standard)
     # ----------------------------
-    # (Assuming helper functions exist in your scope)
     train_id2desc = load_descriptions_from_graphs(train_graphs)
     train_id2card = load_mol_cards_from_graphs(train_graphs)
     query_id2card = load_mol_cards_from_graphs(query_graphs)
@@ -1325,8 +1324,6 @@ def generate_desc(
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    # Optional: Sort back by ID if you prefer original order
-    # df = df.sort_values(by="ID") 
     
     os.makedirs(str(Path(out_csv).parent), exist_ok=True)
     df.to_csv(out_csv, index=False)

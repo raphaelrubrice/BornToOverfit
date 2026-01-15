@@ -324,19 +324,21 @@ def load_molgnn_gps_pooling_from_checkpoint(
             hidden_dim=cfg.get("hidden_dim", 256), 
             out_dim=cfg.get("out_dim", 768), 
             num_layers=cfg.get("num_layers", 4),
-            num_heads=cfg.get("num_heads", 8),
+            num_heads=8,
             dropout=cfg.get("dropout", 0.1),
             pooling=cfg.get("pooling", "sum")
         ).to(device)
+        print("USING 8 HEADS")
     except:
         gnn = MolGNN_GPS_pooling(
-        hidden_dim=cfg.get("hidden_dim", 256), 
-        out_dim=cfg.get("out_dim", 768), 
-        num_layers=cfg.get("num_layers", 4),
-        num_heads=cfg.get("num_heads", 4),
-        dropout=cfg.get("dropout", 0.1),
-        pooling=cfg.get("pooling", "sum")
-    ).to(device)
+          hidden_dim=cfg.get("hidden_dim", 256), 
+          out_dim=cfg.get("out_dim", 768), 
+          num_layers=cfg.get("num_layers", 4),
+          num_heads=cfg.get("num_heads", 4),
+          dropout=cfg.get("dropout", 0.1),
+          pooling=cfg.get("pooling", "sum")
+          ).to(device)
+    print("Using", gnn)
     print("Loading..")
     state = torch.load(model_path, map_location=device, weights_only=False)
     print("State loaded", state.keys())
